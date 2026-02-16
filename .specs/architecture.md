@@ -152,32 +152,144 @@ This enables interactive A2UI interfaces: tap buttons, scroll lists, navigate.
 - **Snapshot format**: PNG preferred over JPEG (sharp text, no compression artifacts on grayscale).
 - **Partial refresh**: use partial e-ink refresh for incremental A2UI updates; full refresh periodically to clear ghosting.
 
+## WiFi
+
+The node does **not** manage WiFi credentials. It reuses the networks already configured by the user in Nickel's stock UI.
+
+### How it works
+
+Nickel stores WiFi config in `/etc/wpa_supplicant/wpa_supplicant.conf`. When our node launches and Nickel is frozen, it brings WiFi up itself (same approach as KOReader):
+
+1. **Power on** the WiFi chip (`insmod sdio_wifi_pwr.ko` or ioctl, device-dependent)
+2. **Load** the WiFi kernel module (Broadcom `dhd` on Glo HD)
+3. **Bring up** the interface (`ifconfig eth0 up` — older Kobos use `eth0`, not `wlan0`)
+4. **Start** `wpa_supplicant` with Nickel's existing config → auto-connects to known networks
+5. **tsnet** uses this WiFi connection to join the tailnet
+
+At exit, the launcher script tears down WiFi cleanly before resuming Nickel.
+
+**Reference**: KOReader's [`platform/kobo/enable-wifi.sh`](https://github.com/koreader/koreader/blob/master/platform/kobo/enable-wifi.sh) handles all Kobo WiFi chip variants. We can reuse or adapt this script.
+
+### tsnet and kernel tun/tap
+
+`tsnet` normally uses a userspace networking stack (no kernel tun/tap device needed). This is important because the Glo HD's kernel 3.0.35 may not have `CONFIG_TUN` enabled. To verify: check `/dev/net/tun` on the device. If absent, tsnet's userspace mode is the fallback — it works, but routes traffic through SOCKS/HTTP proxy internally.
+
+## Power Management
+
+E-ink displays retain their image without power. This is a key advantage for our node.
+
+### Sleep/Wake Cycle
+
+1. **Active** — node is running, WiFi on, gateway connected, canvas updating
+2. **Sleep** — triggered by power button short press or inactivity timeout:
+   - Node renders a final frame (last canvas state, clock, or status summary)
+   - WiFi is powered down (saves battery)
+   - System suspends (`echo mem > /sys/power/state`)
+   - Display retains the last rendered image — zero power consumption
+3. **Wake** — triggered by power button press:
+   - System resumes from suspend
+   - Node re-enables WiFi (re-runs enable-wifi sequence)
+   - tsnet reconnects to tailnet
+   - Gateway WebSocket reconnects
+   - Canvas refreshes with any pending updates
+
+### Power button handling
+
+The power button is a Linux input event (`/dev/input/eventX`, `EV_KEY` code `KEY_POWER`). The node listens for:
+- **Short press** → sleep/wake toggle
+- **Long press (3s)** → exit node, return to Nickel
+
+This is the hardware escape — always works even if the UI is unresponsive.
+
+### Battery life
+
+With WiFi off during sleep and e-ink retaining the display, battery life should be similar to normal Kobo usage (weeks of standby). Active use with WiFi will drain faster, but the Glo HD's battery handles hours of connected use.
+
 ## Deployment (NickelMenu)
 
-Initial deployment uses **NickelMenu** — the standard way to launch custom apps on Kobo alongside the stock Nickel firmware.
+The node is launched via **NickelMenu** — the standard way to run custom apps on Kobo. It follows the same lifecycle pattern as KOReader: freeze Nickel, take over, resume Nickel on exit.
 
 ### Installation
 
-1. Install NickelMenu on the Kobo (one-time, via `.adds/nm/` on the SD card)
-2. Place the binary and config in `/mnt/onboard/.adds/openclaw/`:
+1. Install NickelMenu on the Kobo (one-time, via `KoboRoot.tgz` in `.kobo/`)
+2. Place files in `/mnt/onboard/.adds/openclaw/`:
    ```
    /mnt/onboard/.adds/openclaw/
    ├── openclaw-node-kobo          # the Go binary
-   ├── start.sh                    # launcher script (WiFi check, env setup)
-   └── tsnet-state/                # Tailscale persistent state
+   ├── start.sh                    # launcher script
+   ├── enable-wifi.sh              # WiFi bringup (adapted from KOReader)
+   ├── disable-wifi.sh             # WiFi teardown
+   ├── config.json                 # user config (gateway hostname, device name)
+   ├── tsnet-state/                # Tailscale persistent state (auto-generated)
+   └── logs/                       # crash logs
    ```
-3. Add a NickelMenu entry:
+3. Add a NickelMenu entry in `/mnt/onboard/.adds/nm/openclaw`:
    ```
    menu_item :main :OpenClaw :cmd_spawn :quiet :/mnt/onboard/.adds/openclaw/start.sh
    ```
-4. The user taps "OpenClaw" in the Kobo menu → the node starts, joins tailnet, connects to gateway
+4. The user taps "OpenClaw" in the Kobo menu → node starts
+
+### config.json
+
+Minimal config — no secrets needed thanks to Tailscale auth:
+
+```json
+{
+  "gateway": "azade.airplane-catfish.ts.net",
+  "name": "kobo-glohd"
+}
+```
+
+The gateway has `allowTailscale: true`, so the node authenticates via Tailscale identity alone. No gateway token required.
+
+### Launcher script (start.sh)
+
+```bash
+#!/bin/sh
+cd /mnt/onboard/.adds/openclaw
+
+# Freeze Nickel (don't kill — we want to resume it later)
+killall -STOP nickel
+
+# Save Nickel's framebuffer for restoration
+dd if=/dev/fb0 of=.nickel_screen.raw 2>/dev/null
+
+# Bring up WiFi with Nickel's saved networks
+./enable-wifi.sh
+
+# Run the node
+./openclaw-node-kobo 2>> logs/crash.log
+
+# Tear down WiFi
+./disable-wifi.sh
+
+# Restore Nickel's screen
+cat .nickel_screen.raw > /dev/fb0 2>/dev/null
+rm -f .nickel_screen.raw
+
+# Resume Nickel
+killall -CONT nickel
+```
+
+### Exit gestures
+
+Since the canvas is fullscreen, the node provides two ways to exit:
+
+- **Long press power button (3s)** — hardware escape, always works
+- **Swipe from top edge** — shows an overlay menu (Quit / Sleep / Refresh screen)
 
 ### Coexistence with Nickel
 
-- The node runs as a background process alongside Nickel
-- When actively displaying canvas content, it writes to the framebuffer (takes over the display)
-- `canvas.hide` restores Nickel's display
-- Future: auto-start at boot via init script (once stable)
+- Nickel is **frozen** (`SIGSTOP`), not killed — it resumes exactly where it was
+- On reboot (battery death, crash, firmware update), Nickel starts normally; the node is not auto-launched
+- Future option: auto-start at boot via init script (opt-in, once stable)
+
+### First-time Tailscale auth
+
+On first launch, tsnet has no state yet. The node:
+1. Displays a Tailscale auth URL on the e-ink screen (and/or a QR code)
+2. User scans/visits the URL on their phone → approves in Tailscale admin
+3. tsnet saves its state to `tsnet-state/` — subsequent launches auto-connect
 
 ## Cross-Compilation
 

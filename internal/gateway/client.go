@@ -21,34 +21,37 @@ type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, 
 type InvokeHandler func(ctx context.Context, req InvokeRequestParams) (interface{}, error)
 
 type Client struct {
-	url        string
-	header     http.Header
-	dialer     DialContextFunc
-	logger     zerolog.Logger
-	register   NodeRegistration
-	onInvoke   InvokeHandler
-	connMu     sync.Mutex
-	conn       *websocket.Conn
-	requestSeq atomic.Uint64
+	url          string
+	header       http.Header
+	dialer       DialContextFunc
+	logger       zerolog.Logger
+	register     NodeRegistration
+	onInvoke     InvokeHandler
+	onRegistered func(context.Context) error
+	connMu       sync.Mutex
+	conn         *websocket.Conn
+	requestSeq   atomic.Uint64
 }
 
 type Config struct {
-	URL      string
-	Header   http.Header
-	Dialer   DialContextFunc
-	Logger   zerolog.Logger
-	Register NodeRegistration
-	OnInvoke InvokeHandler
+	URL          string
+	Header       http.Header
+	Dialer       DialContextFunc
+	Logger       zerolog.Logger
+	Register     NodeRegistration
+	OnInvoke     InvokeHandler
+	OnRegistered func(context.Context) error
 }
 
 func New(cfg Config) *Client {
 	return &Client{
-		url:      cfg.URL,
-		header:   cfg.Header,
-		dialer:   cfg.Dialer,
-		logger:   cfg.Logger,
-		register: cfg.Register,
-		onInvoke: cfg.OnInvoke,
+		url:          cfg.URL,
+		header:       cfg.Header,
+		dialer:       cfg.Dialer,
+		logger:       cfg.Logger,
+		register:     cfg.Register,
+		onInvoke:     cfg.OnInvoke,
+		onRegistered: cfg.OnRegistered,
 	}
 }
 
@@ -85,6 +88,11 @@ func (c *Client) Run(ctx context.Context) error {
 			c.logger.Error().Err(err).Msg("gateway registration failed")
 			c.closeConn()
 			continue
+		}
+		if c.onRegistered != nil {
+			if err := c.onRegistered(ctx); err != nil {
+				c.logger.Warn().Err(err).Msg("gateway registered callback failed")
+			}
 		}
 		if err := c.readLoop(ctx); err != nil {
 			c.logger.Warn().Err(err).Msg("gateway read loop ended")

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/openclaw/openclaw-node-kobo/internal/eink"
+	"github.com/rs/zerolog"
 )
 
 type ActionSender interface {
@@ -16,11 +16,13 @@ type ActionSender interface {
 }
 
 type Handler struct {
-	fb       *eink.Framebuffer
-	renderer *Renderer
-	state    *A2UIState
-	logger   zerolog.Logger
-	sender   ActionSender
+	fb                *eink.Framebuffer
+	renderer          *Renderer
+	state             *A2UIState
+	logger            zerolog.Logger
+	sender            ActionSender
+	resetIdle         func()
+	commandProcessing func(bool)
 }
 
 func NewHandler(fb *eink.Framebuffer, renderer *Renderer, sender ActionSender, logger zerolog.Logger) *Handler {
@@ -31,6 +33,14 @@ func NewHandler(fb *eink.Framebuffer, renderer *Renderer, sender ActionSender, l
 		logger:   logger,
 		sender:   sender,
 	}
+}
+
+func (h *Handler) SetIdleResetter(reset func()) {
+	h.resetIdle = reset
+}
+
+func (h *Handler) SetCommandProcessing(set func(bool)) {
+	h.commandProcessing = set
 }
 
 func (h *Handler) HandleInvoke(ctx context.Context, req InvokeRequest) (interface{}, error) {
@@ -143,5 +153,20 @@ func sanitizeCommand(cmd string) string {
 
 func (h *Handler) HandleInvokeRequest(ctx context.Context, req InvokeRequest) (interface{}, error) {
 	req.Command = sanitizeCommand(req.Command)
+	if h.resetIdle != nil {
+		h.resetIdle()
+	}
+	if h.commandProcessing != nil {
+		h.commandProcessing(true)
+		defer h.commandProcessing(false)
+	}
 	return h.HandleInvoke(ctx, req)
+}
+
+func (h *Handler) FullRefresh() error {
+	h.renderer.Render(h.state.Components())
+	if err := h.fb.WriteGray(h.renderer.Image); err != nil {
+		return err
+	}
+	return h.fb.Refresh(eink.Update{Full: true, Waveform: eink.WaveformModeGC16})
 }

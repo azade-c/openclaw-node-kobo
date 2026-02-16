@@ -6,32 +6,38 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/openclaw/openclaw-node-kobo/internal/canvas"
 	"github.com/openclaw/openclaw-node-kobo/internal/eink"
 	"github.com/openclaw/openclaw-node-kobo/internal/gateway"
+	"github.com/openclaw/openclaw-node-kobo/internal/power"
 	"github.com/openclaw/openclaw-node-kobo/internal/tailnet"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
 type FileConfig struct {
-	Gateway      string `json:"gateway"`
-	GatewayPort  int    `json:"gatewayPort,omitempty"`
-	GatewayTLS   bool   `json:"gatewayTLS,omitempty"`
-	GatewayPath  string `json:"gatewayPath,omitempty"`
-	Name         string `json:"name"`
-	StateDir     string `json:"stateDir,omitempty"`
-	TouchDevice  string `json:"touchDevice,omitempty"`
-	Framebuffer  string `json:"framebuffer,omitempty"`
-	LogLevel     string `json:"logLevel,omitempty"`
-	HTTPUserAgent string `json:"httpUserAgent,omitempty"`
+	Gateway        string `json:"gateway"`
+	GatewayPort    int    `json:"gatewayPort,omitempty"`
+	GatewayTLS     bool   `json:"gatewayTLS,omitempty"`
+	GatewayPath    string `json:"gatewayPath,omitempty"`
+	Name           string `json:"name"`
+	StateDir       string `json:"stateDir,omitempty"`
+	TouchDevice    string `json:"touchDevice,omitempty"`
+	Framebuffer    string `json:"framebuffer,omitempty"`
+	LogLevel       string `json:"logLevel,omitempty"`
+	HTTPUserAgent  string `json:"httpUserAgent,omitempty"`
+	IdleTimeoutMin *int   `json:"idleTimeoutMin,omitempty"`
+	SuspendEnabled *bool  `json:"suspendEnabled,omitempty"`
 }
 
 func main() {
@@ -104,11 +110,14 @@ func main() {
 
 	wsURL := gatewayURL(cfg.GatewayTLS, cfg.Gateway, cfg.GatewayPort, cfg.GatewayPath)
 	var handler *canvas.Handler
-	client := gateway.New(gateway.Config{
-		URL:    wsURL,
-		Header: http.Header{"User-Agent": {userAgent(cfg)}},
-		Dialer: tail.DialContext,
-		Logger: log.Logger,
+	readyState := newReadyState()
+	powerManager := newPowerManager(cfg, *cfgPath, log.Logger)
+	var client *gateway.Client
+	client = gateway.New(gateway.Config{
+		URL:      wsURL,
+		Header:   http.Header{"User-Agent": {userAgent(cfg)}},
+		Dialer:   tail.DialContext,
+		Logger:   log.Logger,
 		Register: gateway.DefaultRegistration(),
 		OnInvoke: func(ctx context.Context, req gateway.InvokeRequestParams) (interface{}, error) {
 			if handler == nil {
@@ -116,11 +125,47 @@ func main() {
 			}
 			return handler.HandleInvokeRequest(ctx, canvas.InvokeRequest{Command: req.Command, Args: req.Args})
 		},
+		OnRegistered: func(ctx context.Context) error {
+			return sendNodeReady(ctx, client, readyState.NextReason())
+		},
 	})
 	handler = canvas.NewHandler(fb, renderer, client, log.Logger)
+	handler.SetIdleResetter(powerManager.ResetIdle)
+	handler.SetCommandProcessing(powerManager.SetCommandProcessing)
+
+	powerManager.OnResume = func() {
+		readyState.SetReason("wake")
+		powerManager.SetWiFiConnecting(true)
+		defer powerManager.SetWiFiConnecting(false)
+
+		if err := runScript(context.Background(), filepath.Join(filepath.Dir(*cfgPath), "enable-wifi.sh")); err != nil {
+			log.Warn().Err(err).Msg("failed to enable wifi")
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		if err := waitForIP(waitCtx, wifiInterface()); err != nil {
+			log.Warn().Err(err).Msg("wifi did not acquire IP")
+		}
+		if err := handler.FullRefresh(); err != nil {
+			log.Warn().Err(err).Msg("failed full refresh after wake")
+		}
+	}
+
+	powerManager.OnSuspend = func() {
+		if err := runScript(context.Background(), filepath.Join(filepath.Dir(*cfgPath), "disable-wifi.sh")); err != nil {
+			log.Warn().Err(err).Msg("failed to disable wifi")
+		}
+	}
 
 	if cfg.TouchDevice != "" {
-		go startTouchLoop(ctx, cfg.TouchDevice, handler, log.Logger, cancel)
+		go startTouchLoop(ctx, cfg.TouchDevice, handler, powerManager, log.Logger, cancel)
+	}
+	if powerManager.SuspendEnabled && powerManager.IdleTimeout > 0 {
+		go func() {
+			if err := powerManager.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warn().Err(err).Msg("power manager exited")
+			}
+		}()
 	}
 
 	if err := client.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -193,7 +238,7 @@ func userAgent(cfg FileConfig) string {
 	return "openclaw-node-kobo/0.1"
 }
 
-func startTouchLoop(ctx context.Context, device string, handler *canvas.Handler, logger zerolog.Logger, cancel context.CancelFunc) {
+func startTouchLoop(ctx context.Context, device string, handler *canvas.Handler, powerManager *power.Manager, logger zerolog.Logger, cancel context.CancelFunc) {
 	input, err := eink.OpenInputDevice(device)
 	if err != nil {
 		logger.Warn().Err(err).Msg("failed to open touch device")
@@ -213,23 +258,29 @@ func startTouchLoop(ctx context.Context, device string, handler *canvas.Handler,
 			if !ok {
 				return
 			}
+			if powerManager != nil {
+				powerManager.ResetIdle()
+			}
 			if touch.Down {
 				handler.HandleTouch(ctx, touch.X, touch.Y)
 			}
-		case power, ok := <-powerCh:
+		case powerEvent, ok := <-powerCh:
 			if !ok {
 				return
 			}
-			if power.Pressed {
-				powerDownAt = power.At
+			if powerEvent.Pressed {
+				powerDownAt = powerEvent.At
 			} else if !powerDownAt.IsZero() {
-				duration := power.At.Sub(powerDownAt)
+				duration := powerEvent.At.Sub(powerDownAt)
 				powerDownAt = time.Time{}
 				if duration >= 3*time.Second {
 					logger.Info().Msg("power long press: exiting")
 					cancel()
 				} else {
-					if err := suspend(); err != nil {
+					if powerManager == nil {
+						continue
+					}
+					if err := powerManager.Suspend(); err != nil && !errors.Is(err, power.ErrSuspendBlocked) {
 						logger.Warn().Err(err).Msg("failed to suspend")
 					}
 				}
@@ -243,6 +294,118 @@ func startTouchLoop(ctx context.Context, device string, handler *canvas.Handler,
 	}
 }
 
-func suspend() error {
-	return os.WriteFile("/sys/power/state", []byte("mem"), 0)
+func newPowerManager(cfg FileConfig, cfgPath string, logger zerolog.Logger) *power.Manager {
+	idleTimeoutMin := 5
+	if cfg.IdleTimeoutMin != nil {
+		idleTimeoutMin = *cfg.IdleTimeoutMin
+	}
+	suspendEnabled := true
+	if cfg.SuspendEnabled != nil {
+		suspendEnabled = *cfg.SuspendEnabled
+	}
+	manager := &power.Manager{
+		IdleTimeout:    time.Duration(idleTimeoutMin) * time.Minute,
+		SuspendEnabled: suspendEnabled,
+		WiFiScript:     filepath.Join(filepath.Dir(cfgPath), "enable-wifi.sh"),
+	}
+	if idleTimeoutMin <= 0 {
+		manager.IdleTimeout = 0
+	}
+	if !suspendEnabled {
+		logger.Info().Msg("suspend disabled by config")
+	}
+	return manager
+}
+
+func wifiInterface() string {
+	if _, err := os.Stat("/sys/class/net/wlan0"); err == nil {
+		return "wlan0"
+	}
+	return "eth0"
+}
+
+func waitForIP(ctx context.Context, ifaceName string) error {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if hasIP(ifaceName) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func hasIP(ifaceName string) bool {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return false
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ipNet.IP == nil {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func runScript(ctx context.Context, path string) error {
+	cmd := exec.CommandContext(ctx, path)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+type readyState struct {
+	reason string
+	mu     sync.Mutex
+}
+
+func newReadyState() *readyState {
+	return &readyState{reason: "boot"}
+}
+
+func (r *readyState) SetReason(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reason = reason
+}
+
+func (r *readyState) NextReason() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	reason := r.reason
+	if reason != "reconnect" {
+		r.reason = "reconnect"
+	}
+	return reason
+}
+
+func sendNodeReady(ctx context.Context, client *gateway.Client, reason string) error {
+	if client == nil {
+		return errors.New("gateway client not ready")
+	}
+	payload := gateway.EventParams{
+		Event: "node.ready",
+		Data: map[string]interface{}{
+			"reason":    reason,
+			"timestamp": time.Now().UnixMilli(),
+		},
+	}
+	return client.SendEvent(ctx, "node.event", payload)
 }

@@ -7,9 +7,10 @@ import (
 )
 
 type Update struct {
-	Region image.Rectangle
-	Full   bool
-	Fast   bool
+	Region   image.Rectangle
+	Full     bool
+	Fast     bool
+	Waveform int
 }
 
 const (
@@ -59,6 +60,9 @@ func (fb *Framebuffer) Refresh(update Update) error {
 	waveform := WaveformModeAuto
 	if update.Fast {
 		waveform = WaveformModeA2
+	}
+	if update.Waveform != 0 {
+		waveform = update.Waveform
 	}
 	data := mxcfbUpdateData{
 		UpdateRegion: mxcfbRect{

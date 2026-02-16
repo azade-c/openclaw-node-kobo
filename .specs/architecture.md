@@ -300,6 +300,69 @@ build:
 	GOOS=linux GOARCH=arm GOARM=7 go build -o openclaw-node-kobo ./cmd/openclaw-node-kobo
 ```
 
+## Why Go
+
+The language choice is driven by **tsnet** — Tailscale's Go library that embeds the full userspace networking stack into a single binary. Without Go, we'd need a separate `tailscaled` daemon plus coordination scripts.
+
+Trade-offs vs KOReader's Lua/LuaJIT stack:
+- **Binary size**: ~15-20 MB (Go + tsnet) vs ~2 MB (LuaJIT). Acceptable on 4 GB storage.
+- **RAM**: Go runtime + GC uses ~10-30 MB on 512 MB. Fine.
+- **ioctl/framebuffer**: LuaJIT FFI is more elegant, but Go's `syscall.Syscall` works. KOReader's mxcfb constants and structures serve as reference.
+- **Networking/concurrency**: Go excels (goroutines, mature WebSocket libs). Lua is weaker here.
+
+Go for application logic + KOReader's shell scripts for system plumbing = best of both worlds.
+
+## References & Prior Art
+
+### KOReader (primary reference)
+
+[github.com/koreader/koreader](https://github.com/koreader/koreader) — GPL-3.0
+
+The most mature custom app running on Kobo devices. Written in **Lua/LuaJIT** with C libraries (MuPDF, djvulibre, CREngine) and shell scripts for system integration.
+
+**What we reuse from KOReader:**
+
+| Component | How | Files |
+|-----------|-----|-------|
+| WiFi bringup/teardown | Copy/adapt shell scripts | [`platform/kobo/enable-wifi.sh`](https://github.com/koreader/koreader/blob/master/platform/kobo/enable-wifi.sh), `disable-wifi.sh` |
+| Launcher pattern | Same approach (freeze Nickel, run, restore) | [`platform/kobo/koreader.sh`](https://github.com/koreader/koreader/blob/master/platform/kobo/koreader.sh) |
+| mxcfb ioctl constants | Reference for Go reimplementation | [`ffi/framebuffer_mxcfb.lua`](https://github.com/koreader/koreader-base/blob/master/ffi/framebuffer_mxcfb.lua) |
+| Framebuffer setup | Reference for Go reimplementation | [`ffi/framebuffer_linux.lua`](https://github.com/koreader/koreader-base/blob/master/ffi/framebuffer_linux.lua) |
+| Input device mapping | Which `/dev/input/eventX` for which Kobo model | [`frontend/device/kobo/device.lua`](https://github.com/koreader/koreader/blob/master/frontend/device/kobo/device.lua) |
+| Power management | Sleep/wake patterns, power button events | [`frontend/device/kobo/powerd.lua`](https://github.com/koreader/koreader/blob/master/frontend/device/kobo/powerd.lua) |
+| Kobo model detection | Hardware ID → device capabilities | [`frontend/device/kobo/device.lua`](https://github.com/koreader/koreader/blob/master/frontend/device/kobo/device.lua) |
+
+**What we don't reuse:**
+- Lua/LuaJIT code (we're in Go)
+- Rendering engine (we render A2UI components, not PDF/EPUB)
+- C libraries (MuPDF, djvulibre — not needed)
+- UI framework (KOReader's widget system)
+
+### NickelMenu
+
+[github.com/pgaskin/NickelMenu](https://github.com/pgaskin/NickelMenu) — MIT
+
+Injects custom menu entries into Kobo's stock Nickel UI. Our launcher entry point. No code reused directly — we just register a `menu_item` that calls our `start.sh`.
+
+### Tailscale tsnet
+
+[pkg.go.dev/tailscale.com/tsnet](https://pkg.go.dev/tailscale.com/tsnet) — BSD-3-Clause
+
+Go library to embed a Tailscale node into any Go program. Provides userspace networking without requiring a kernel tun/tap device or a separate `tailscaled` daemon.
+
+### OpenClaw (gateway protocol reference)
+
+[github.com/openclaw/openclaw](https://github.com/openclaw/openclaw)
+
+The node WebSocket protocol is defined by the gateway implementation:
+- `src/gateway/client.ts` — client-side WebSocket JSON-RPC
+- `src/gateway/server-node-events.ts` — server-side node event handling
+- `src/canvas-host/a2ui.ts` — A2UI component format and action payloads
+
+### kobli.me
+
+[kobli.me](https://kobli.me) — Kobo Clara hack project. Confirms Go cross-compilation works on Kobo ARM devices.
+
 ## Future Expansion
 
 If shared Go code is extracted for other e-ink devices:

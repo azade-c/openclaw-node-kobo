@@ -31,6 +31,8 @@ type wsConn interface {
 	Close() error
 }
 
+var errGatewayShutdown = errors.New("gateway: shutdown")
+
 type Client struct {
 	url             string
 	header          http.Header
@@ -48,6 +50,27 @@ type Client struct {
 	writeMu         sync.Mutex
 	requestSeq      atomic.Uint64
 	pingInterval    time.Duration
+}
+
+type backoffProvider interface {
+	Backoff() time.Duration
+}
+
+type backoffError struct {
+	err     error
+	backoff time.Duration
+}
+
+func (e backoffError) Error() string {
+	return e.err.Error()
+}
+
+func (e backoffError) Unwrap() error {
+	return e.err
+}
+
+func (e backoffError) Backoff() time.Duration {
+	return e.backoff
 }
 
 type Config struct {
@@ -126,6 +149,7 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := c.registerNode(ctx); err != nil {
 			c.logger.Error().Err(err).Msg("gateway registration failed")
 			c.closeConn()
+			c.applyBackoffOverride(err, &backoff)
 			if err := c.waitBackoff(ctx, &backoff); err != nil {
 				return err
 			}
@@ -140,6 +164,7 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := c.readLoop(ctx); err != nil {
 			c.logger.Warn().Err(err).Msg("gateway read loop ended")
 			c.closeConn()
+			c.applyBackoffOverride(err, &backoff)
 			if err := c.waitBackoff(ctx, &backoff); err != nil {
 				return err
 			}
@@ -206,22 +231,27 @@ func (c *Client) registerNode(ctx context.Context) error {
 		return errors.New("gateway: no connection")
 	}
 	nonce := ""
-	req, err := c.buildConnectRequest(nonce)
-	if err != nil {
-		return err
+	connectSent := false
+	connectID := ""
+	sendConnect := func(nonce string) error {
+		req, err := c.buildConnectRequest(nonce)
+		if err != nil {
+			return err
+		}
+		if err := c.sendFrame(ctx, req); err != nil {
+			return err
+		}
+		connectSent = true
+		connectID = req.ID
+		return nil
 	}
-	if err := c.sendFrame(ctx, req); err != nil {
-		return err
-	}
-	id := req.ID
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			c.handleCloseError(err)
-			return err
+			return c.handleCloseError(err)
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		var base struct {
@@ -237,28 +267,28 @@ func (c *Client) registerNode(ctx context.Context) error {
 				c.logger.Warn().Err(err).Msg("gateway: invalid handshake event")
 				continue
 			}
-			if evt.Event != "connect.challenge" {
-				continue
+			switch evt.Event {
+			case "connect.challenge":
+				var payload struct {
+					Nonce string `json:"nonce"`
+				}
+				if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+					c.logger.Warn().Err(err).Msg("gateway: invalid connect challenge")
+					continue
+				}
+				if payload.Nonce == "" || payload.Nonce == nonce {
+					continue
+				}
+				nonce = payload.Nonce
+				if !connectSent {
+					if err := sendConnect(nonce); err != nil {
+						return err
+					}
+				}
+			case "tick":
+				c.logger.Debug().Msg("gateway: tick")
+			default:
 			}
-			var payload struct {
-				Nonce string `json:"nonce"`
-			}
-			if err := json.Unmarshal(evt.Payload, &payload); err != nil {
-				c.logger.Warn().Err(err).Msg("gateway: invalid connect challenge")
-				continue
-			}
-			if payload.Nonce == "" || payload.Nonce == nonce {
-				continue
-			}
-			nonce = payload.Nonce
-			req, err := c.buildConnectRequest(nonce)
-			if err != nil {
-				return err
-			}
-			if err := c.sendFrame(ctx, req); err != nil {
-				return err
-			}
-			id = req.ID
 			continue
 		}
 		if base.Type != "res" {
@@ -269,7 +299,7 @@ func (c *Client) registerNode(ctx context.Context) error {
 			c.logger.Warn().Err(err).Msg("gateway: invalid handshake response")
 			continue
 		}
-		if res.ID != id {
+		if !connectSent || res.ID != connectID {
 			continue
 		}
 		if !res.OK {
@@ -311,8 +341,7 @@ func (c *Client) readLoop(ctx context.Context) error {
 		}
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			c.handleCloseError(err)
-			return err
+			return c.handleCloseError(err)
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		var base struct {
@@ -334,6 +363,21 @@ func (c *Client) readLoop(ctx context.Context) error {
 				if err := c.handleInvokeEvent(ctx, evt); err != nil {
 					c.logger.Warn().Err(err).Msg("gateway: invoke handler error")
 				}
+			case "shutdown":
+				var payload ShutdownPayload
+				if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+					c.logger.Warn().Err(err).Msg("gateway: invalid shutdown payload")
+					return err
+				}
+				restartMs := payload.RestartExpectedMs
+				if restartMs <= 0 {
+					restartMs = int(time.Second / time.Millisecond)
+				}
+				c.logger.Info().Str("reason", payload.Reason).Msg(fmt.Sprintf("gateway shutting down, reconnect in %dms", restartMs))
+				return backoffError{err: errGatewayShutdown, backoff: time.Duration(restartMs) * time.Millisecond}
+			case "tick":
+				c.logger.Debug().Msg("gateway: tick")
+				continue
 			case "connect.challenge", "voicewake.changed":
 				continue
 			}
@@ -485,7 +529,36 @@ func (c *Client) waitBackoff(ctx context.Context, backoff *time.Duration) error 
 	return nil
 }
 
+func (c *Client) applyBackoffOverride(err error, backoff *time.Duration) {
+	var override backoffProvider
+	if !errors.As(err, &override) {
+		return
+	}
+	target := override.Backoff()
+	if target <= 0 {
+		return
+	}
+	if errors.Is(err, errGatewayShutdown) {
+		*backoff = target
+		return
+	}
+	if *backoff < target {
+		*backoff = target
+	}
+}
+
 func (c *Client) selectConnectAuth() (*ConnectAuth, string) {
+	if c.connectAuth != nil {
+		auth := *c.connectAuth
+		if auth.Token != "" {
+			return &auth, auth.Token
+		}
+		if auth.Password != "" {
+			if c.deviceToken == "" {
+				return &auth, ""
+			}
+		}
+	}
 	if c.deviceToken != "" {
 		password := ""
 		if c.connectAuth != nil {
@@ -496,12 +569,9 @@ func (c *Client) selectConnectAuth() (*ConnectAuth, string) {
 		}
 		return &ConnectAuth{Token: c.deviceToken}, c.deviceToken
 	}
-	if c.connectAuth != nil {
+	if c.connectAuth != nil && c.connectAuth.Password != "" {
 		auth := *c.connectAuth
-		if auth.Token == "" && auth.Password == "" {
-			return nil, ""
-		}
-		return &auth, auth.Token
+		return &auth, ""
 	}
 	return nil, ""
 }
@@ -556,18 +626,27 @@ func (c *Client) buildConnectRequest(nonce string) (RequestFrame, error) {
 	}, nil
 }
 
-func (c *Client) handleCloseError(err error) {
+func (c *Client) handleCloseError(err error) error {
 	var closeErr *websocket.CloseError
 	if !errors.As(err, &closeErr) {
-		return
+		return err
 	}
 	if closeErr.Code != websocket.ClosePolicyViolation {
-		return
+		return err
 	}
-	if !strings.Contains(strings.ToLower(closeErr.Text), "device token mismatch") {
-		return
+	reason := strings.ToLower(closeErr.Text)
+	if strings.Contains(reason, "pairing required") {
+		c.logger.Warn().Msg("pairing required — waiting for approval")
+		return backoffError{err: err, backoff: 10 * time.Second}
 	}
-	c.clearDeviceToken()
+	if strings.Contains(reason, "device identity required") {
+		c.logger.Warn().Msg("device identity required — waiting for approval")
+		return backoffError{err: err, backoff: 10 * time.Second}
+	}
+	if strings.Contains(reason, "device token mismatch") {
+		c.clearDeviceToken()
+	}
+	return err
 }
 
 func (c *Client) clearDeviceToken() {

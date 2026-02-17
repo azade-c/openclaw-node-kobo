@@ -52,9 +52,16 @@ func LoadOrCreateIdentity(path string) (*DeviceIdentity, error) {
 		if err != nil {
 			return nil, err
 		}
+		derivedID := deviceIDFromPublicKey(pub)
 		deviceID := stored.DeviceID
-		if deviceID == "" {
-			deviceID = deviceIDFromPublicKey(pub)
+		if deviceID == "" || deviceID != derivedID {
+			deviceID = derivedID
+			stored.DeviceID = derivedID
+			if updated, err := json.MarshalIndent(stored, "", "  "); err == nil {
+				if err := os.WriteFile(path, updated, 0o600); err == nil {
+					_ = os.Chmod(path, 0o600)
+				}
+			}
 		}
 		return &DeviceIdentity{
 			DeviceID:      deviceID,

@@ -39,6 +39,8 @@ type FileConfig struct {
 	SuspendEnabled *bool  `json:"suspendEnabled,omitempty"`
 }
 
+var version = "dev"
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config file")
 	gatewayHost := flag.String("gateway", "", "gateway hostname")
@@ -120,8 +122,7 @@ func main() {
 	var handler *canvas.Handler
 	powerManager := newPowerManager(cfg, *cfgPath, log.Logger)
 	var client *gateway.Client
-	registration := gateway.DefaultRegistration()
-	registration.Client.DisplayName = cfg.Name
+	registration := buildRegistration(cfg.Name, identity)
 	client = gateway.New(gateway.Config{
 		URL:             wsURL,
 		Header:          http.Header{"User-Agent": {userAgent(cfg)}},
@@ -239,6 +240,16 @@ func setupLogger(level string) {
 	if parsed, err := zerolog.ParseLevel(level); err == nil {
 		log.Logger = log.Level(parsed)
 	}
+}
+
+func buildRegistration(name string, identity *gateway.DeviceIdentity) gateway.NodeRegistration {
+	registration := gateway.DefaultRegistration()
+	registration.Client.DisplayName = name
+	registration.Client.Version = version
+	if identity != nil {
+		registration.Client.InstanceID = identity.DeviceID
+	}
+	return registration
 }
 
 func gatewayURL(tls bool, host string, port int, path string) string {

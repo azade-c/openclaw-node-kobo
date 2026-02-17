@@ -181,6 +181,51 @@ func TestLoadOrCreateIdentity_DerivedDeviceID(t *testing.T) {
 	}
 }
 
+func TestLoadOrCreateIdentity_UpdatesMismatchedDeviceID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "device.json")
+	identity, err := LoadOrCreateIdentity(path)
+	if err != nil {
+		t.Fatalf("create identity: %v", err)
+	}
+	stored := deviceIdentityFile{
+		Version:       deviceIdentityVersion,
+		DeviceID:      "wrong-id",
+		PublicKeyPem:  identity.PublicKeyPem,
+		PrivateKeyPem: identity.PrivateKeyPem,
+	}
+	encoded, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("marshal stored: %v", err)
+	}
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatalf("write device file: %v", err)
+	}
+	reloaded, err := LoadOrCreateIdentity(path)
+	if err != nil {
+		t.Fatalf("load identity: %v", err)
+	}
+	publicKey, err := parsePublicKey(reloaded.PublicKeyPem)
+	if err != nil {
+		t.Fatalf("parse public key: %v", err)
+	}
+	expected := deviceIDFromPublicKey(publicKey)
+	if reloaded.DeviceID != expected {
+		t.Fatalf("expected derived device id")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read device file: %v", err)
+	}
+	var updated deviceIdentityFile
+	if err := json.Unmarshal(raw, &updated); err != nil {
+		t.Fatalf("unmarshal updated: %v", err)
+	}
+	if updated.DeviceID != expected {
+		t.Fatalf("expected updated device id in file")
+	}
+}
+
 func TestDeviceIdentity_SignEmptyPayload(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "device.json")

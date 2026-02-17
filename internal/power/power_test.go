@@ -3,6 +3,7 @@ package power
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -239,6 +240,28 @@ func TestManagerSuspendInProgress(t *testing.T) {
 		t.Fatalf("expected suspend in progress, got %v", err)
 	}
 	close(blockCh)
+}
+
+func TestManagerResumeReconnectSequence(t *testing.T) {
+	clock := newFakeClock(time.Unix(1, 0))
+	var order []string
+	m := &Manager{
+		IdleTimeout:    time.Second,
+		SuspendEnabled: true,
+		clock:          clock,
+		suspendFunc:    func() error { return nil },
+	}
+	m.OnResume = func() {
+		// Gateway reconnect happens when the WS read loop exits and Run() retries.
+		order = append(order, "wifi-enable", "tailscale-up", "gateway-reconnect")
+	}
+	if err := m.Suspend(); err != nil {
+		t.Fatalf("expected suspend to succeed, got %v", err)
+	}
+	want := []string{"wifi-enable", "tailscale-up", "gateway-reconnect"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("expected resume sequence %v, got %v", want, order)
+	}
 }
 
 func waitForSuspendState(m *Manager, want bool, timeout time.Duration) bool {

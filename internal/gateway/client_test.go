@@ -155,21 +155,8 @@ func TestClientConnectHandshake(t *testing.T) {
 		done <- err
 	}()
 
-	var req RequestFrame
-	select {
-	case record := <-mock.writeCh:
-		if record.messageType != websocket.TextMessage {
-			t.Fatalf("unexpected message type: %d", record.messageType)
-		}
-		if err := json.Unmarshal(record.data, &req); err != nil {
-			t.Fatalf("unmarshal req: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("connect request not sent")
-	}
-	if req.Type != "req" || req.Method != "connect" {
-		t.Fatalf("unexpected request: type=%s method=%s", req.Type, req.Method)
-	}
+	sendConnectChallenge(t, mock, "nonce-123")
+	req := waitForConnectRequest(t, ctx, mock)
 	var params ConnectParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		t.Fatalf("unmarshal connect params: %v", err)
@@ -249,18 +236,8 @@ func TestClientConnectAuth(t *testing.T) {
 		done <- client.registerNode(ctx)
 	}()
 
-	var req RequestFrame
-	select {
-	case record := <-mock.writeCh:
-		if record.messageType != websocket.TextMessage {
-			t.Fatalf("unexpected message type: %d", record.messageType)
-		}
-		if err := json.Unmarshal(record.data, &req); err != nil {
-			t.Fatalf("unmarshal req: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("connect request not sent")
-	}
+	sendConnectChallenge(t, mock, "nonce-123")
+	req := waitForConnectRequest(t, ctx, mock)
 	var params ConnectParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		t.Fatalf("unmarshal connect params: %v", err)
@@ -320,29 +297,7 @@ func TestClientConnectChallenge(t *testing.T) {
 		done <- client.registerNode(ctx)
 	}()
 
-	firstReq := waitForConnectRequest(t, ctx, mock)
-	var firstParams ConnectParams
-	if err := json.Unmarshal(firstReq.Params, &firstParams); err != nil {
-		t.Fatalf("unmarshal first connect params: %v", err)
-	}
-	if firstParams.Device == nil {
-		t.Fatalf("expected device info")
-	}
-	if firstParams.Device.Nonce != "" {
-		t.Fatalf("unexpected nonce in first connect")
-	}
-
-	challenge := EventFrame{
-		Type:    "event",
-		Event:   "connect.challenge",
-		Payload: json.RawMessage(`{"nonce":"nonce-123"}`),
-	}
-	challengeData, err := json.Marshal(challenge)
-	if err != nil {
-		t.Fatalf("marshal challenge: %v", err)
-	}
-	mock.readCh <- challengeData
-
+	sendConnectChallenge(t, mock, "nonce-123")
 	secondReq := waitForConnectRequest(t, ctx, mock)
 	var secondParams ConnectParams
 	if err := json.Unmarshal(secondReq.Params, &secondParams); err != nil {
@@ -411,7 +366,7 @@ func TestClientDeviceTokenMismatchClearsToken(t *testing.T) {
 		DeviceTokenPath: tokenPath,
 	})
 	client.deviceToken = "token-value"
-	client.handleCloseError(&websocket.CloseError{Code: websocket.ClosePolicyViolation, Text: "device token mismatch"})
+	_ = client.handleCloseError(&websocket.CloseError{Code: websocket.ClosePolicyViolation, Text: "device token mismatch"})
 	if client.deviceToken != "" {
 		t.Fatalf("expected token cleared")
 	}
@@ -484,6 +439,7 @@ func TestClient_ConnectHandshake_RejectsNonHelloOk(t *testing.T) {
 		done <- client.registerNode(ctx)
 	}()
 
+	sendConnectChallenge(t, mock, "nonce-123")
 	req := waitForConnectRequest(t, ctx, mock)
 	res := ResponseFrame{
 		Type:    "res",
@@ -525,6 +481,7 @@ func TestClient_ConnectHandshake_ServerRejects(t *testing.T) {
 		done <- client.registerNode(ctx)
 	}()
 
+	sendConnectChallenge(t, mock, "nonce-123")
 	req := waitForConnectRequest(t, ctx, mock)
 	res := ResponseFrame{
 		Type: "res",
@@ -565,6 +522,7 @@ func TestClient_ConnectHandshake_ServerRejectsWithError(t *testing.T) {
 		done <- client.registerNode(ctx)
 	}()
 
+	sendConnectChallenge(t, mock, "nonce-123")
 	req := waitForConnectRequest(t, ctx, mock)
 	res := ResponseFrame{
 		Type: "res",
@@ -609,6 +567,7 @@ func TestClient_ConnectHandshake_DeviceTokenStored(t *testing.T) {
 		done <- client.registerNode(ctx)
 	}()
 
+	sendConnectChallenge(t, mock, "nonce-123")
 	req := waitForConnectRequest(t, ctx, mock)
 	res := ResponseFrame{
 		Type: "res",
@@ -642,7 +601,7 @@ func TestClient_ConnectHandshake_DeviceTokenStored(t *testing.T) {
 	}
 }
 
-func TestClient_ConnectHandshake_DeviceTokenPreferred(t *testing.T) {
+func TestClient_ConnectHandshake_ExplicitTokenPreferred(t *testing.T) {
 	mock := newMockConn()
 	client := New(Config{
 		Logger:       zerolog.Nop(),
@@ -661,13 +620,14 @@ func TestClient_ConnectHandshake_DeviceTokenPreferred(t *testing.T) {
 		done <- client.registerNode(ctx)
 	}()
 
+	sendConnectChallenge(t, mock, "nonce-123")
 	req := waitForConnectRequest(t, ctx, mock)
 	var params ConnectParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		t.Fatalf("unmarshal params: %v", err)
 	}
-	if params.Auth == nil || params.Auth.Token != "device-token" {
-		t.Fatalf("expected device token auth")
+	if params.Auth == nil || params.Auth.Token != "shared-token" {
+		t.Fatalf("expected explicit token auth")
 	}
 	res := ResponseFrame{
 		Type:    "res",
@@ -714,29 +674,10 @@ func TestClient_ConnectChallenge_IgnoresSameNonce(t *testing.T) {
 		done <- client.registerNode(ctx)
 	}()
 
-	_ = waitForConnectRequest(t, ctx, mock)
-	challenge := EventFrame{
-		Type:    "event",
-		Event:   "connect.challenge",
-		Payload: json.RawMessage(`{"nonce":"nonce-123"}`),
-	}
-	challengeData, err := json.Marshal(challenge)
-	if err != nil {
-		t.Fatalf("marshal challenge: %v", err)
-	}
-	mock.readCh <- challengeData
+	sendConnectChallenge(t, mock, "nonce-123")
 	secondReq := waitForConnectRequest(t, ctx, mock)
 
-	sameChallenge := EventFrame{
-		Type:    "event",
-		Event:   "connect.challenge",
-		Payload: json.RawMessage(`{"nonce":"nonce-123"}`),
-	}
-	sameData, err := json.Marshal(sameChallenge)
-	if err != nil {
-		t.Fatalf("marshal challenge: %v", err)
-	}
-	mock.readCh <- sameData
+	sendConnectChallenge(t, mock, "nonce-123")
 
 	select {
 	case <-mock.writeCh:
@@ -789,17 +730,7 @@ func TestClient_ConnectChallenge_IgnoresEmptyNonce(t *testing.T) {
 		done <- client.registerNode(ctx)
 	}()
 
-	req := waitForConnectRequest(t, ctx, mock)
-	challenge := EventFrame{
-		Type:    "event",
-		Event:   "connect.challenge",
-		Payload: json.RawMessage(`{"nonce":""}`),
-	}
-	challengeData, err := json.Marshal(challenge)
-	if err != nil {
-		t.Fatalf("marshal challenge: %v", err)
-	}
-	mock.readCh <- challengeData
+	sendConnectChallenge(t, mock, "")
 
 	select {
 	case <-mock.writeCh:
@@ -807,6 +738,8 @@ func TestClient_ConnectChallenge_IgnoresEmptyNonce(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
+	sendConnectChallenge(t, mock, "nonce-456")
+	req := waitForConnectRequest(t, ctx, mock)
 	res := ResponseFrame{
 		Type:    "res",
 		ID:      req.ID,
@@ -1005,6 +938,93 @@ func TestClient_ReadLoop_VoicewakeIgnored(t *testing.T) {
 	<-done
 }
 
+func TestClient_ReadLoop_TickEvent(t *testing.T) {
+	mock := newMockConn()
+	invoked := make(chan struct{}, 1)
+	client := New(Config{
+		Logger:       zerolog.Nop(),
+		PingInterval: time.Hour,
+		OnInvoke: func(ctx context.Context, req InvokeRequestParams) (interface{}, error) {
+			invoked <- struct{}{}
+			return nil, nil
+		},
+	})
+	client.setConn(mock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- client.readLoop(ctx)
+	}()
+
+	event := EventFrame{
+		Type:    "event",
+		Event:   "tick",
+		Payload: json.RawMessage(`{}`),
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	mock.readCh <- data
+
+	select {
+	case <-invoked:
+		t.Fatalf("unexpected invoke handler call")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	mock.Close()
+	<-done
+}
+
+func TestClient_ReadLoop_ShutdownEvent(t *testing.T) {
+	mock := newMockConn()
+	client := New(Config{
+		Logger:       zerolog.Nop(),
+		PingInterval: time.Hour,
+		OnInvoke: func(ctx context.Context, req InvokeRequestParams) (interface{}, error) {
+			return nil, nil
+		},
+	})
+	client.setConn(mock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- client.readLoop(ctx)
+	}()
+
+	event := EventFrame{
+		Type:  "event",
+		Event: "shutdown",
+		Payload: json.RawMessage(`{
+			"reason":"maintenance",
+			"restartExpectedMs":5000
+		}`),
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	mock.readCh <- data
+
+	select {
+	case err := <-done:
+		if err == nil || !errors.Is(err, errGatewayShutdown) {
+			t.Fatalf("expected shutdown error, got %v", err)
+		}
+		backoff := backoffFromErr(t, err)
+		if backoff != 5*time.Second {
+			t.Fatalf("expected shutdown backoff 5s, got %v", backoff)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("shutdown did not end read loop")
+	}
+}
+
 func TestClient_SendEvent_NoConnection(t *testing.T) {
 	client := New(Config{})
 	if err := client.SendEvent(context.Background(), "node.event", NodeEventParams{Event: "test"}); err == nil {
@@ -1037,14 +1057,14 @@ func TestClient_SendEvent_MarshalsCorrectly(t *testing.T) {
 	}
 }
 
-func TestClient_SelectConnectAuth_DeviceTokenOverSharedSecret(t *testing.T) {
+func TestClient_SelectConnectAuth_ExplicitTokenOverDeviceToken(t *testing.T) {
 	client := New(Config{
 		AuthToken: "shared-token",
 	})
 	client.deviceToken = "device-token"
 	auth, token := client.selectConnectAuth()
-	if auth == nil || auth.Token != "device-token" || token != "device-token" {
-		t.Fatalf("expected device token auth")
+	if auth == nil || auth.Token != "shared-token" || token != "shared-token" {
+		t.Fatalf("expected explicit token auth")
 	}
 }
 
@@ -1198,7 +1218,7 @@ func TestClient_HandleCloseError_NonWebsocket(t *testing.T) {
 		DeviceTokenPath: tokenPath,
 	})
 	client.deviceToken = "token"
-	client.handleCloseError(errors.New("nope"))
+	_ = client.handleCloseError(errors.New("nope"))
 	if client.deviceToken == "" {
 		t.Fatalf("expected token to remain")
 	}
@@ -1218,7 +1238,7 @@ func TestClient_HandleCloseError_WrongCode(t *testing.T) {
 		DeviceTokenPath: tokenPath,
 	})
 	client.deviceToken = "token"
-	client.handleCloseError(&websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "device token mismatch"})
+	_ = client.handleCloseError(&websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "device token mismatch"})
 	if client.deviceToken == "" {
 		t.Fatalf("expected token to remain")
 	}
@@ -1235,9 +1255,57 @@ func TestClient_HandleCloseError_WrongReason(t *testing.T) {
 		DeviceTokenPath: tokenPath,
 	})
 	client.deviceToken = "token"
-	client.handleCloseError(&websocket.CloseError{Code: websocket.ClosePolicyViolation, Text: "other reason"})
+	_ = client.handleCloseError(&websocket.CloseError{Code: websocket.ClosePolicyViolation, Text: "other reason"})
 	if client.deviceToken == "" {
 		t.Fatalf("expected token to remain")
+	}
+}
+
+func TestClient_HandleCloseError_PairingRequired(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "device-token.json")
+	if err := SaveDeviceToken(tokenPath, "token"); err != nil {
+		t.Fatalf("save token: %v", err)
+	}
+	client := New(Config{
+		Logger:          zerolog.Nop(),
+		DeviceTokenPath: tokenPath,
+	})
+	client.deviceToken = "token"
+	err := client.handleCloseError(&websocket.CloseError{Code: websocket.ClosePolicyViolation, Text: "pairing required"})
+	backoff := backoffFromErr(t, err)
+	if backoff != 10*time.Second {
+		t.Fatalf("expected pairing backoff 10s, got %v", backoff)
+	}
+	if client.deviceToken == "" {
+		t.Fatalf("expected token to remain")
+	}
+	if _, err := os.Stat(tokenPath); err != nil {
+		t.Fatalf("expected token file to remain")
+	}
+}
+
+func TestClient_HandleCloseError_DeviceIdentityRequired(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "device-token.json")
+	if err := SaveDeviceToken(tokenPath, "token"); err != nil {
+		t.Fatalf("save token: %v", err)
+	}
+	client := New(Config{
+		Logger:          zerolog.Nop(),
+		DeviceTokenPath: tokenPath,
+	})
+	client.deviceToken = "token"
+	err := client.handleCloseError(&websocket.CloseError{Code: websocket.ClosePolicyViolation, Text: "device identity required"})
+	backoff := backoffFromErr(t, err)
+	if backoff != 10*time.Second {
+		t.Fatalf("expected device identity backoff 10s, got %v", backoff)
+	}
+	if client.deviceToken == "" {
+		t.Fatalf("expected token to remain")
+	}
+	if _, err := os.Stat(tokenPath); err != nil {
+		t.Fatalf("expected token file to remain")
 	}
 }
 
@@ -1347,6 +1415,35 @@ func TestParseInvokePayload_MissingRequestID(t *testing.T) {
 	if _, err := parseInvokePayload(raw); err == nil {
 		t.Fatalf("expected error for missing request id")
 	}
+}
+
+func backoffFromErr(t *testing.T, err error) time.Duration {
+	t.Helper()
+	var provider interface {
+		Backoff() time.Duration
+	}
+	if !errors.As(err, &provider) {
+		t.Fatalf("expected backoff provider")
+	}
+	return provider.Backoff()
+}
+
+func sendConnectChallenge(t *testing.T, mock *mockConn, nonce string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]string{"nonce": nonce})
+	if err != nil {
+		t.Fatalf("marshal challenge payload: %v", err)
+	}
+	challenge := EventFrame{
+		Type:  "event",
+		Event: "connect.challenge",
+		Payload: payload,
+	}
+	data, err := json.Marshal(challenge)
+	if err != nil {
+		t.Fatalf("marshal challenge: %v", err)
+	}
+	mock.readCh <- data
 }
 
 func waitForConnectRequest(t *testing.T, ctx context.Context, mock *mockConn) RequestFrame {

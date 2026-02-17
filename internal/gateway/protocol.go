@@ -25,6 +25,11 @@ type EventFrame struct {
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
+type ShutdownPayload struct {
+	Reason            string `json:"reason,omitempty"`
+	RestartExpectedMs int    `json:"restartExpectedMs,omitempty"`
+}
+
 type GatewayError struct {
 	Code         string          `json:"code,omitempty"`
 	Message      string          `json:"message,omitempty"`

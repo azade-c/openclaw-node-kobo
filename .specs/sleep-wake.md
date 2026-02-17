@@ -26,7 +26,8 @@ When `suspend()` returns (= device woke up):
 
 1. **Re-enable WiFi** — run `enable-wifi.sh` (or equivalent Go calls)
 2. **Wait for network** — poll for IP on `wlan0`, timeout 15s
-3. **Gateway reconnect** — already handled by the client's reconnect loop with backoff; WiFi being up is sufficient
+3. **Wait for Tailscale** — call `tsnet.Server.Up(ctx)` which blocks until the Tailscale node is connected to the coordination server and has a working WireGuard tunnel. Timeout 30s. This avoids the gateway reconnect loop dialing into the void and accumulating backoff/error logs while Tailscale re-negotiates endpoints.
+4. **Gateway reconnect** — now deterministic: tsnet is up, dial will succeed on first try
 4. **Send `node.ready` event** — after successful re-registration, emit a `node.ready` event so the gateway/agent knows the node just woke up and can re-push canvas state
 5. **Full screen refresh** — trigger a GC16 (full) e-ink refresh to clear ghosting artifacts from sleep
 
@@ -86,9 +87,15 @@ func (m *Manager) Run(ctx context.Context) error  // auto-sleep loop
 
 - Create `power.Manager` with callbacks
 - `onSuspend`: disable WiFi (optional, saves power)
-- `onResume`: enable WiFi, wait for IP, trigger screen refresh
+- `onResume`: enable WiFi, wait for IP, wait for Tailscale (`tsnet.Up()`), trigger screen refresh
 - Wire idle reset into touch handler and canvas handler
 - After gateway `registerNode`, send `node.ready` event with reason
+
+### Changes to `internal/tailnet/tailnet.go`
+
+- Add `Up(ctx context.Context) error` method wrapping `tsnet.Server.Up(ctx)`
+- Blocks until Tailscale is connected (coordination server + WireGuard tunnel ready)
+- Called in `OnResume` after `waitForIP()`, before letting the gateway reconnect proceed
 
 ### Changes to `internal/gateway/client.go`
 

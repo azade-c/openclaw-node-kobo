@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -204,63 +205,22 @@ func (c *Client) registerNode(ctx context.Context) error {
 	if conn == nil {
 		return errors.New("gateway: no connection")
 	}
-	id := c.nextID()
-	auth := c.connectAuth
-	tokenForPayload := ""
-	if c.deviceToken != "" {
-		auth = &ConnectAuth{Token: c.deviceToken}
-		tokenForPayload = c.deviceToken
-	} else if c.connectAuth != nil {
-		tokenForPayload = c.connectAuth.Token
-	}
-	var deviceInfo *DeviceInfo
-	if c.identity != nil {
-		signedAtMs := time.Now().UnixMilli()
-		payload := BuildDeviceAuthPayload(
-			c.identity.DeviceID,
-			c.register.Client.ID,
-			c.register.Client.Mode,
-			c.register.Role,
-			nil,
-			signedAtMs,
-			tokenForPayload,
-			"",
-		)
-		deviceInfo = &DeviceInfo{
-			ID:        c.identity.DeviceID,
-			PublicKey: c.identity.PublicKeyRawBase64Url(),
-			Signature: c.identity.Sign(payload),
-			SignedAt:  signedAtMs,
-		}
-	}
-	params, err := json.Marshal(ConnectParams{
-		MinProtocol: ProtocolVersion,
-		MaxProtocol: ProtocolVersion,
-		Client:      c.register.Client,
-		Role:        c.register.Role,
-		Caps:        c.register.Caps,
-		Commands:    c.register.Commands,
-		Auth:        auth,
-		Device:      deviceInfo,
-	})
+	nonce := ""
+	req, err := c.buildConnectRequest(nonce)
 	if err != nil {
 		return err
-	}
-	req := RequestFrame{
-		Type:   "req",
-		ID:     id,
-		Method: "connect",
-		Params: params,
 	}
 	if err := c.sendFrame(ctx, req); err != nil {
 		return err
 	}
+	id := req.ID
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		_, data, err := conn.ReadMessage()
 		if err != nil {
+			c.handleCloseError(err)
 			return err
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -269,6 +229,36 @@ func (c *Client) registerNode(ctx context.Context) error {
 		}
 		if err := json.Unmarshal(data, &base); err != nil {
 			c.logger.Warn().Err(err).Msg("gateway: invalid handshake message")
+			continue
+		}
+		if base.Type == "event" {
+			var evt EventFrame
+			if err := json.Unmarshal(data, &evt); err != nil {
+				c.logger.Warn().Err(err).Msg("gateway: invalid handshake event")
+				continue
+			}
+			if evt.Event != "connect.challenge" {
+				continue
+			}
+			var payload struct {
+				Nonce string `json:"nonce"`
+			}
+			if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+				c.logger.Warn().Err(err).Msg("gateway: invalid connect challenge")
+				continue
+			}
+			if payload.Nonce == "" || payload.Nonce == nonce {
+				continue
+			}
+			nonce = payload.Nonce
+			req, err := c.buildConnectRequest(nonce)
+			if err != nil {
+				return err
+			}
+			if err := c.sendFrame(ctx, req); err != nil {
+				return err
+			}
+			id = req.ID
 			continue
 		}
 		if base.Type != "res" {
@@ -321,6 +311,7 @@ func (c *Client) readLoop(ctx context.Context) error {
 		}
 		_, data, err := conn.ReadMessage()
 		if err != nil {
+			c.handleCloseError(err)
 			return err
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -338,10 +329,13 @@ func (c *Client) readLoop(ctx context.Context) error {
 				c.logger.Warn().Err(err).Msg("gateway: invalid event frame")
 				continue
 			}
-			if evt.Event == "node.invoke.request" {
+			switch evt.Event {
+			case "node.invoke.request":
 				if err := c.handleInvokeEvent(ctx, evt); err != nil {
 					c.logger.Warn().Err(err).Msg("gateway: invoke handler error")
 				}
+			case "connect.challenge", "voicewake.changed":
+				continue
 			}
 		case "req":
 			var req RequestFrame
@@ -489,4 +483,104 @@ func (c *Client) waitBackoff(ctx context.Context, backoff *time.Duration) error 
 		*backoff *= 2
 	}
 	return nil
+}
+
+func (c *Client) selectConnectAuth() (*ConnectAuth, string) {
+	if c.deviceToken != "" {
+		password := ""
+		if c.connectAuth != nil {
+			password = c.connectAuth.Password
+		}
+		if password != "" {
+			return &ConnectAuth{Token: c.deviceToken, Password: password}, c.deviceToken
+		}
+		return &ConnectAuth{Token: c.deviceToken}, c.deviceToken
+	}
+	if c.connectAuth != nil {
+		auth := *c.connectAuth
+		if auth.Token == "" && auth.Password == "" {
+			return nil, ""
+		}
+		return &auth, auth.Token
+	}
+	return nil, ""
+}
+
+func (c *Client) buildConnectRequest(nonce string) (RequestFrame, error) {
+	id := c.nextID()
+	auth, tokenForPayload := c.selectConnectAuth()
+	var deviceInfo *DeviceInfo
+	if c.identity != nil {
+		signedAtMs := time.Now().UnixMilli()
+		payload := BuildDeviceAuthPayload(
+			c.identity.DeviceID,
+			c.register.Client.ID,
+			c.register.Client.Mode,
+			c.register.Role,
+			c.register.Scopes,
+			signedAtMs,
+			tokenForPayload,
+			nonce,
+		)
+		deviceInfo = &DeviceInfo{
+			ID:        c.identity.DeviceID,
+			PublicKey: c.identity.PublicKeyRawBase64Url(),
+			Signature: c.identity.Sign(payload),
+			SignedAt:  signedAtMs,
+			Nonce:     nonce,
+		}
+	}
+	params, err := json.Marshal(ConnectParams{
+		MinProtocol: ProtocolVersion,
+		MaxProtocol: ProtocolVersion,
+		Client:      c.register.Client,
+		Role:        c.register.Role,
+		Caps:        c.register.Caps,
+		Commands:    c.register.Commands,
+		Permissions: c.register.Permissions,
+		PathEnv:     c.register.PathEnv,
+		Scopes:      c.register.Scopes,
+		Auth:        auth,
+		Device:      deviceInfo,
+		Locale:      c.register.Locale,
+		UserAgent:   c.register.UserAgent,
+	})
+	if err != nil {
+		return RequestFrame{}, err
+	}
+	return RequestFrame{
+		Type:   "req",
+		ID:     id,
+		Method: "connect",
+		Params: params,
+	}, nil
+}
+
+func (c *Client) handleCloseError(err error) {
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		return
+	}
+	if closeErr.Code != websocket.ClosePolicyViolation {
+		return
+	}
+	if !strings.Contains(strings.ToLower(closeErr.Text), "device token mismatch") {
+		return
+	}
+	c.clearDeviceToken()
+}
+
+func (c *Client) clearDeviceToken() {
+	if c.deviceToken == "" && c.deviceTokenPath == "" {
+		return
+	}
+	c.deviceToken = ""
+	if c.deviceTokenPath == "" {
+		return
+	}
+	if err := ClearDeviceToken(c.deviceTokenPath); err != nil {
+		c.logger.Warn().Err(err).Msg("gateway: failed to clear device token")
+	} else {
+		c.logger.Info().Msg("gateway: cleared stale device token")
+	}
 }

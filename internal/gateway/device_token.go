@@ -38,3 +38,13 @@ func SaveDeviceToken(path string, token string) error {
 	}
 	return os.WriteFile(path, encoded, 0o600)
 }
+
+func ClearDeviceToken(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}

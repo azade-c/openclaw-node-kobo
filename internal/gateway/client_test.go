@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -292,6 +293,86 @@ func TestClientConnectAuth(t *testing.T) {
 	}
 }
 
+func TestClientConnectChallenge(t *testing.T) {
+	mock := newMockConn()
+	dir := t.TempDir()
+	identityPath := filepath.Join(dir, "device.json")
+	identity, err := LoadOrCreateIdentity(identityPath)
+	if err != nil {
+		t.Fatalf("create identity: %v", err)
+	}
+
+	client := New(Config{
+		Logger:   zerolog.Nop(),
+		Register: DefaultRegistration(),
+		OnInvoke: func(ctx context.Context, req InvokeRequestParams) (interface{}, error) {
+			return nil, nil
+		},
+		Identity: identity,
+	})
+	client.setConn(mock)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- client.registerNode(ctx)
+	}()
+
+	firstReq := waitForConnectRequest(t, ctx, mock)
+	var firstParams ConnectParams
+	if err := json.Unmarshal(firstReq.Params, &firstParams); err != nil {
+		t.Fatalf("unmarshal first connect params: %v", err)
+	}
+	if firstParams.Device == nil {
+		t.Fatalf("expected device info")
+	}
+	if firstParams.Device.Nonce != "" {
+		t.Fatalf("unexpected nonce in first connect")
+	}
+
+	challenge := EventFrame{
+		Type:    "event",
+		Event:   "connect.challenge",
+		Payload: json.RawMessage(`{"nonce":"nonce-123"}`),
+	}
+	challengeData, err := json.Marshal(challenge)
+	if err != nil {
+		t.Fatalf("marshal challenge: %v", err)
+	}
+	mock.readCh <- challengeData
+
+	secondReq := waitForConnectRequest(t, ctx, mock)
+	var secondParams ConnectParams
+	if err := json.Unmarshal(secondReq.Params, &secondParams); err != nil {
+		t.Fatalf("unmarshal second connect params: %v", err)
+	}
+	if secondParams.Device == nil || secondParams.Device.Nonce != "nonce-123" {
+		t.Fatalf("expected nonce in second connect")
+	}
+
+	res := ResponseFrame{
+		Type:    "res",
+		ID:      secondReq.ID,
+		OK:      true,
+		Payload: json.RawMessage(`{"type":"hello-ok"}`),
+	}
+	resData, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal res: %v", err)
+	}
+	mock.readCh <- resData
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("register failed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("register did not finish")
+	}
+}
+
 func TestClientPingTicker(t *testing.T) {
 	mock := newMockConn()
 	client := New(Config{
@@ -316,4 +397,44 @@ func TestClientPingTicker(t *testing.T) {
 		}
 	}
 	close(done)
+}
+
+func TestClientDeviceTokenMismatchClearsToken(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "device-token.json")
+	if err := SaveDeviceToken(tokenPath, "token-value"); err != nil {
+		t.Fatalf("save token: %v", err)
+	}
+	client := New(Config{
+		Logger:          zerolog.Nop(),
+		DeviceTokenPath: tokenPath,
+	})
+	client.deviceToken = "token-value"
+	client.handleCloseError(&websocket.CloseError{Code: websocket.ClosePolicyViolation, Text: "device token mismatch"})
+	if client.deviceToken != "" {
+		t.Fatalf("expected token cleared")
+	}
+	if _, err := os.Stat(tokenPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected token file removed")
+	}
+}
+
+func waitForConnectRequest(t *testing.T, ctx context.Context, mock *mockConn) RequestFrame {
+	t.Helper()
+	var req RequestFrame
+	select {
+	case record := <-mock.writeCh:
+		if record.messageType != websocket.TextMessage {
+			t.Fatalf("unexpected message type: %d", record.messageType)
+		}
+		if err := json.Unmarshal(record.data, &req); err != nil {
+			t.Fatalf("unmarshal req: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("connect request not sent")
+	}
+	if req.Type != "req" || req.Method != "connect" {
+		t.Fatalf("unexpected request: type=%s method=%s", req.Type, req.Method)
+	}
+	return req
 }

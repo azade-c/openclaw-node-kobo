@@ -43,7 +43,16 @@ func TestIdentitySignVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create identity: %v", err)
 	}
-	payload := "v2|device|client|mode|role||123|token|"
+	payload := BuildDeviceAuthPayload(
+		"device",
+		"client",
+		"mode",
+		"role",
+		nil,
+		123,
+		"token",
+		"nonce",
+	)
 	signature := identity.Sign(payload)
 	sigBytes, err := base64.RawURLEncoding.DecodeString(signature)
 	if err != nil {
@@ -59,7 +68,7 @@ func TestIdentitySignVerify(t *testing.T) {
 }
 
 func TestBuildDeviceAuthPayloadFormat(t *testing.T) {
-	payload := BuildDeviceAuthPayload(
+	payloadV2 := BuildDeviceAuthPayload(
 		"device-id",
 		"client-id",
 		"client-mode",
@@ -69,9 +78,23 @@ func TestBuildDeviceAuthPayloadFormat(t *testing.T) {
 		"token-value",
 		"nonce-value",
 	)
-	expected := "v2|device-id|client-id|client-mode|node|scope-a,scope-b|1700000000000|token-value|nonce-value"
-	if payload != expected {
-		t.Fatalf("unexpected payload: %s", payload)
+	expectedV2 := "v2|device-id|client-id|client-mode|node|scope-a,scope-b|1700000000000|token-value|nonce-value"
+	if payloadV2 != expectedV2 {
+		t.Fatalf("unexpected payload: %s", payloadV2)
+	}
+	payloadV1 := BuildDeviceAuthPayload(
+		"device-id",
+		"client-id",
+		"client-mode",
+		"node",
+		[]string{"scope-a", "scope-b"},
+		1700000000000,
+		"token-value",
+		"",
+	)
+	expectedV1 := "v1|device-id|client-id|client-mode|node|scope-a,scope-b|1700000000000|token-value"
+	if payloadV1 != expectedV1 {
+		t.Fatalf("unexpected payload: %s", payloadV1)
 	}
 }
 

@@ -34,12 +34,14 @@ type GatewayError struct {
 }
 
 type ClientInfo struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"displayName,omitempty"`
-	Version     string `json:"version"`
-	Platform    string `json:"platform"`
-	Mode        string `json:"mode"`
-	InstanceID  string `json:"instanceId,omitempty"`
+	ID              string `json:"id"`
+	DisplayName     string `json:"displayName,omitempty"`
+	Version         string `json:"version"`
+	Platform        string `json:"platform"`
+	DeviceFamily    string `json:"deviceFamily,omitempty"`
+	ModelIdentifier string `json:"modelIdentifier,omitempty"`
+	Mode            string `json:"mode"`
+	InstanceID      string `json:"instanceId,omitempty"`
 }
 
 type ConnectAuth struct {
@@ -48,14 +50,19 @@ type ConnectAuth struct {
 }
 
 type ConnectParams struct {
-	MinProtocol int          `json:"minProtocol"`
-	MaxProtocol int          `json:"maxProtocol"`
-	Client      ClientInfo   `json:"client"`
-	Role        string       `json:"role,omitempty"`
-	Caps        []string     `json:"caps,omitempty"`
-	Commands    []string     `json:"commands,omitempty"`
-	Auth        *ConnectAuth `json:"auth,omitempty"`
-	Device      *DeviceInfo  `json:"device,omitempty"`
+	MinProtocol int             `json:"minProtocol"`
+	MaxProtocol int             `json:"maxProtocol"`
+	Client      ClientInfo      `json:"client"`
+	Role        string          `json:"role,omitempty"`
+	Caps        []string        `json:"caps,omitempty"`
+	Commands    []string        `json:"commands,omitempty"`
+	Permissions map[string]bool `json:"permissions,omitempty"`
+	PathEnv     string          `json:"pathEnv,omitempty"`
+	Scopes      []string        `json:"scopes,omitempty"`
+	Auth        *ConnectAuth    `json:"auth,omitempty"`
+	Device      *DeviceInfo     `json:"device,omitempty"`
+	Locale      string          `json:"locale,omitempty"`
+	UserAgent   string          `json:"userAgent,omitempty"`
 }
 
 type DeviceInfo struct {
@@ -67,10 +74,15 @@ type DeviceInfo struct {
 }
 
 type NodeRegistration struct {
-	Client   ClientInfo `json:"client"`
-	Role     string     `json:"role"`
-	Caps     []string   `json:"caps"`
-	Commands []string   `json:"commands"`
+	Client      ClientInfo      `json:"client"`
+	Role        string          `json:"role"`
+	Caps        []string        `json:"caps"`
+	Commands    []string        `json:"commands"`
+	Permissions map[string]bool `json:"permissions,omitempty"`
+	PathEnv     string          `json:"pathEnv,omitempty"`
+	Scopes      []string        `json:"scopes,omitempty"`
+	Locale      string          `json:"locale,omitempty"`
+	UserAgent   string          `json:"userAgent,omitempty"`
 }
 
 type HelloOkPayload struct {

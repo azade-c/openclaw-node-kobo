@@ -127,7 +127,24 @@ func (d *DeviceIdentity) Sign(payload string) string {
 
 func BuildDeviceAuthPayload(deviceID, clientID, clientMode, role string, scopes []string, signedAtMs int64, token, nonce string) string {
 	scopeValue := strings.Join(scopes, ",")
-	return "v2|" + deviceID + "|" + clientID + "|" + clientMode + "|" + role + "|" + scopeValue + "|" + strconv.FormatInt(signedAtMs, 10) + "|" + token + "|" + nonce
+	version := "v1"
+	if nonce != "" {
+		version = "v2"
+	}
+	parts := []string{
+		version,
+		deviceID,
+		clientID,
+		clientMode,
+		role,
+		scopeValue,
+		strconv.FormatInt(signedAtMs, 10),
+		token,
+	}
+	if version == "v2" {
+		parts = append(parts, nonce)
+	}
+	return strings.Join(parts, "|")
 }
 
 func base64URLEncode(data []byte) string {

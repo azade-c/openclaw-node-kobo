@@ -20,6 +20,16 @@ type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, 
 
 type InvokeHandler func(ctx context.Context, req InvokeRequestParams) (interface{}, error)
 
+type wsConn interface {
+	WriteMessage(messageType int, data []byte) error
+	ReadMessage() (messageType int, p []byte, err error)
+	SetWriteDeadline(t time.Time) error
+	SetReadDeadline(t time.Time) error
+	SetReadLimit(limit int64)
+	SetPongHandler(h func(appData string) error)
+	Close() error
+}
+
 type Client struct {
 	url          string
 	header       http.Header
@@ -29,8 +39,10 @@ type Client struct {
 	onInvoke     InvokeHandler
 	onRegistered func(context.Context) error
 	connMu       sync.Mutex
-	conn         *websocket.Conn
+	conn         wsConn
+	writeMu      sync.Mutex
 	requestSeq   atomic.Uint64
+	pingInterval time.Duration
 }
 
 type Config struct {
@@ -41,9 +53,14 @@ type Config struct {
 	Register     NodeRegistration
 	OnInvoke     InvokeHandler
 	OnRegistered func(context.Context) error
+	PingInterval time.Duration
 }
 
 func New(cfg Config) *Client {
+	pingInterval := cfg.PingInterval
+	if pingInterval == 0 {
+		pingInterval = 30 * time.Second
+	}
 	return &Client{
 		url:          cfg.URL,
 		header:       cfg.Header,
@@ -52,6 +69,7 @@ func New(cfg Config) *Client {
 		register:     cfg.Register,
 		onInvoke:     cfg.OnInvoke,
 		onRegistered: cfg.OnRegistered,
+		pingInterval: pingInterval,
 	}
 }
 
@@ -103,31 +121,39 @@ func (c *Client) Run(ctx context.Context) error {
 }
 
 func (c *Client) SendEvent(ctx context.Context, method string, params interface{}) error {
-	env := Envelope{
-		Method: method,
-	}
 	payload, err := json.Marshal(params)
 	if err != nil {
 		return err
 	}
-	env.Params = payload
-	return c.send(ctx, env)
+	req := RequestFrame{
+		Type:   "req",
+		ID:     c.nextID(),
+		Method: method,
+		Params: payload,
+	}
+	return c.sendFrame(ctx, req)
 }
 
-func (c *Client) send(ctx context.Context, env Envelope) error {
+func (c *Client) sendFrame(ctx context.Context, frame interface{}) error {
 	conn := c.getConn()
 	if conn == nil {
 		return errors.New("gateway: no connection")
 	}
-	data, err := json.Marshal(env)
+	data, err := json.Marshal(frame)
 	if err != nil {
 		return err
 	}
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	return conn.WriteMessage(websocket.TextMessage, data)
+	return c.writeMessage(conn, websocket.TextMessage, data)
 }
 
-func (c *Client) connect(ctx context.Context) (*websocket.Conn, error) {
+func (c *Client) writeMessage(conn wsConn, messageType int, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return conn.WriteMessage(messageType, data)
+}
+
+func (c *Client) connect(ctx context.Context) (wsConn, error) {
 	dialer := websocket.Dialer{
 		Proxy:            http.ProxyFromEnvironment,
 		HandshakeTimeout: 10 * time.Second,
@@ -147,27 +173,30 @@ func (c *Client) connect(ctx context.Context) (*websocket.Conn, error) {
 }
 
 func (c *Client) registerNode(ctx context.Context) error {
-	id := c.nextID()
-	params, err := json.Marshal(c.register)
-	if err != nil {
-		return err
-	}
-	idRaw := json.RawMessage([]byte(fmt.Sprintf("%q", id)))
-	env := Envelope{
-		ID:     &idRaw,
-		Method: "node.register",
-		Params: params,
-	}
-	if err := c.send(ctx, env); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (c *Client) readLoop(ctx context.Context) error {
 	conn := c.getConn()
 	if conn == nil {
 		return errors.New("gateway: no connection")
+	}
+	id := c.nextID()
+	params, err := json.Marshal(ConnectParams{
+		MinProtocol: ProtocolVersion,
+		MaxProtocol: ProtocolVersion,
+		Client:      c.register.Client,
+		Role:        c.register.Role,
+		Caps:        c.register.Caps,
+		Commands:    c.register.Commands,
+	})
+	if err != nil {
+		return err
+	}
+	req := RequestFrame{
+		Type:   "req",
+		ID:     id,
+		Method: "connect",
+		Params: params,
+	}
+	if err := c.sendFrame(ctx, req); err != nil {
+		return err
 	}
 	for {
 		if ctx.Err() != nil {
@@ -177,61 +206,185 @@ func (c *Client) readLoop(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		var env Envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			c.logger.Warn().Err(err).Msg("gateway: invalid message")
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		var base struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(data, &base); err != nil {
+			c.logger.Warn().Err(err).Msg("gateway: invalid handshake message")
 			continue
 		}
-		if env.Method == "node.invoke.request" {
-			if err := c.handleInvoke(ctx, env); err != nil {
-				c.logger.Warn().Err(err).Msg("gateway: invoke handler error")
+		if base.Type != "res" {
+			continue
+		}
+		var res ResponseFrame
+		if err := json.Unmarshal(data, &res); err != nil {
+			c.logger.Warn().Err(err).Msg("gateway: invalid handshake response")
+			continue
+		}
+		if res.ID != id {
+			continue
+		}
+		if !res.OK {
+			if res.Error != nil && res.Error.Message != "" {
+				return errors.New(res.Error.Message)
 			}
+			return errors.New("gateway: connect rejected")
+		}
+		var hello struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(res.Payload, &hello); err != nil {
+			return err
+		}
+		if hello.Type != "hello-ok" {
+			return errors.New("gateway: unexpected handshake payload")
+		}
+		return nil
+	}
+}
+
+func (c *Client) readLoop(ctx context.Context) error {
+	conn := c.getConn()
+	if conn == nil {
+		return errors.New("gateway: no connection")
+	}
+	done := make(chan struct{})
+	go c.pingLoop(ctx, conn, done)
+	defer close(done)
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		var base struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(data, &base); err != nil {
+			c.logger.Warn().Err(err).Msg("gateway: invalid frame")
+			continue
+		}
+		switch base.Type {
+		case "event":
+			var evt EventFrame
+			if err := json.Unmarshal(data, &evt); err != nil {
+				c.logger.Warn().Err(err).Msg("gateway: invalid event frame")
+				continue
+			}
+			if evt.Event == "node.invoke.request" {
+				if err := c.handleInvokeEvent(ctx, evt); err != nil {
+					c.logger.Warn().Err(err).Msg("gateway: invoke handler error")
+				}
+			}
+		case "req":
+			var req RequestFrame
+			if err := json.Unmarshal(data, &req); err != nil {
+				c.logger.Warn().Err(err).Msg("gateway: invalid request frame")
+				continue
+			}
+			if req.Method == "node.invoke.request" {
+				if err := c.handleInvokeRequest(ctx, req); err != nil {
+					c.logger.Warn().Err(err).Msg("gateway: invoke handler error")
+				}
+			}
+		case "res":
 			continue
 		}
 	}
 }
 
-func (c *Client) handleInvoke(ctx context.Context, env Envelope) error {
-	var params InvokeRequestParams
-	if err := json.Unmarshal(env.Params, &params); err != nil {
+func (c *Client) handleInvokeEvent(ctx context.Context, evt EventFrame) error {
+	params, err := parseInvokePayload(evt.Payload)
+	if err != nil {
 		return err
 	}
+	return c.handleInvoke(ctx, params)
+}
+
+func (c *Client) handleInvokeRequest(ctx context.Context, req RequestFrame) error {
+	params, err := parseInvokePayload(req.Params)
+	if err != nil {
+		return err
+	}
+	return c.handleInvoke(ctx, params)
+}
+
+func (c *Client) handleInvoke(ctx context.Context, params InvokeRequestParams) error {
 	result, err := c.onInvoke(ctx, params)
-	if env.ID != nil {
-		return c.respondRPC(ctx, env.ID, result, err)
-	}
-	return c.respondEvent(ctx, params.RequestID, result, err)
+	return c.sendInvokeResult(ctx, params, result, err)
 }
 
-func (c *Client) respondRPC(ctx context.Context, id *json.RawMessage, result interface{}, err error) error {
-	var env Envelope
-	if err != nil {
-		env.ID = id
-		env.Error = &RPCError{Code: 1, Message: err.Error()}
-		return c.send(ctx, env)
+func (c *Client) sendInvokeResult(ctx context.Context, req InvokeRequestParams, result interface{}, err error) error {
+	params := InvokeResultParams{
+		RequestID: req.RequestID,
+		NodeID:    req.NodeID,
+		OK:        err == nil,
+		Result:    result,
 	}
-	resultRaw, marshalErr := json.Marshal(result)
-	if marshalErr != nil {
-		return marshalErr
-	}
-	env.ID = id
-	env.Result = resultRaw
-	return c.send(ctx, env)
-}
-
-func (c *Client) respondEvent(ctx context.Context, requestID string, result interface{}, err error) error {
-	params := InvokeResultParams{RequestID: requestID}
 	if err != nil {
-		params.Error = &RPCError{Code: 1, Message: err.Error()}
-	} else {
-		params.Result = result
+		params.Error = &NodeInvokeError{Message: err.Error()}
 	}
 	payload, marshalErr := json.Marshal(params)
 	if marshalErr != nil {
 		return marshalErr
 	}
-	env := Envelope{Method: "node.invoke.result", Params: payload}
-	return c.send(ctx, env)
+	frame := RequestFrame{
+		Type:   "req",
+		ID:     c.nextID(),
+		Method: "node.invoke.result",
+		Params: payload,
+	}
+	return c.sendFrame(ctx, frame)
+}
+
+func parseInvokePayload(raw json.RawMessage) (InvokeRequestParams, error) {
+	var payload struct {
+		ID             string          `json:"id"`
+		NodeID         string          `json:"nodeId"`
+		Command        string          `json:"command"`
+		ParamsJSON     *string         `json:"paramsJSON,omitempty"`
+		Params         json.RawMessage `json:"params,omitempty"`
+		IdempotencyKey string          `json:"idempotencyKey,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return InvokeRequestParams{}, err
+	}
+	if payload.ID == "" || payload.NodeID == "" || payload.Command == "" {
+		return InvokeRequestParams{}, errors.New("gateway: invalid invoke payload")
+	}
+	var args json.RawMessage
+	if payload.ParamsJSON != nil && *payload.ParamsJSON != "" {
+		args = json.RawMessage([]byte(*payload.ParamsJSON))
+	} else if len(payload.Params) > 0 {
+		args = payload.Params
+	}
+	return InvokeRequestParams{
+		RequestID: payload.ID,
+		NodeID:    payload.NodeID,
+		Command:   payload.Command,
+		Args:      args,
+	}, nil
+}
+
+func (c *Client) pingLoop(ctx context.Context, conn wsConn, done <-chan struct{}) {
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := c.writeMessage(conn, websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
 }
 
 func (c *Client) nextID() string {
@@ -240,13 +393,13 @@ func (c *Client) nextID() string {
 	return fmt.Sprintf("%d-%d", val, seed)
 }
 
-func (c *Client) getConn() *websocket.Conn {
+func (c *Client) getConn() wsConn {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 	return c.conn
 }
 
-func (c *Client) setConn(conn *websocket.Conn) {
+func (c *Client) setConn(conn wsConn) {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 	c.conn = conn

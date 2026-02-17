@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"syscall"
 	"time"
 
@@ -110,23 +109,21 @@ func main() {
 
 	wsURL := gatewayURL(cfg.GatewayTLS, cfg.Gateway, cfg.GatewayPort, cfg.GatewayPath)
 	var handler *canvas.Handler
-	readyState := newReadyState()
 	powerManager := newPowerManager(cfg, *cfgPath, log.Logger)
 	var client *gateway.Client
+	registration := gateway.DefaultRegistration()
+	registration.Client.DisplayName = cfg.Name
 	client = gateway.New(gateway.Config{
 		URL:      wsURL,
 		Header:   http.Header{"User-Agent": {userAgent(cfg)}},
 		Dialer:   tail.DialContext,
 		Logger:   log.Logger,
-		Register: gateway.DefaultRegistration(),
+		Register: registration,
 		OnInvoke: func(ctx context.Context, req gateway.InvokeRequestParams) (interface{}, error) {
 			if handler == nil {
 				return nil, errors.New("handler not ready")
 			}
 			return handler.HandleInvokeRequest(ctx, canvas.InvokeRequest{Command: req.Command, Args: req.Args})
-		},
-		OnRegistered: func(ctx context.Context) error {
-			return sendNodeReady(ctx, client, readyState.NextReason())
 		},
 	})
 	handler = canvas.NewHandler(fb, renderer, client, log.Logger)
@@ -134,13 +131,14 @@ func main() {
 	handler.SetCommandProcessing(powerManager.SetCommandProcessing)
 
 	powerManager.OnResume = func() {
-		readyState.SetReason("wake")
 		powerManager.SetWiFiConnecting(true)
 		defer powerManager.SetWiFiConnecting(false)
 
-		if err := runScript(context.Background(), filepath.Join(filepath.Dir(*cfgPath), "enable-wifi.sh")); err != nil {
+		enableCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		if err := runScript(enableCtx, filepath.Join(filepath.Dir(*cfgPath), "enable-wifi.sh")); err != nil {
 			log.Warn().Err(err).Msg("failed to enable wifi")
 		}
+		cancel()
 		waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 		if err := waitForIP(waitCtx, wifiInterface()); err != nil {
@@ -157,9 +155,11 @@ func main() {
 	}
 
 	powerManager.OnSuspend = func() {
-		if err := runScript(context.Background(), filepath.Join(filepath.Dir(*cfgPath), "disable-wifi.sh")); err != nil {
+		disableCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := runScript(disableCtx, filepath.Join(filepath.Dir(*cfgPath), "disable-wifi.sh")); err != nil {
 			log.Warn().Err(err).Msg("failed to disable wifi")
 		}
+		cancel()
 	}
 
 	if cfg.TouchDevice != "" {
@@ -311,7 +311,6 @@ func newPowerManager(cfg FileConfig, cfgPath string, logger zerolog.Logger) *pow
 	manager := &power.Manager{
 		IdleTimeout:    time.Duration(idleTimeoutMin) * time.Minute,
 		SuspendEnabled: suspendEnabled,
-		WiFiScript:     filepath.Join(filepath.Dir(cfgPath), "enable-wifi.sh"),
 	}
 	if idleTimeoutMin <= 0 {
 		manager.IdleTimeout = 0
@@ -374,43 +373,4 @@ func runScript(ctx context.Context, path string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
-}
-
-type readyState struct {
-	reason string
-	mu     sync.Mutex
-}
-
-func newReadyState() *readyState {
-	return &readyState{reason: "boot"}
-}
-
-func (r *readyState) SetReason(reason string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.reason = reason
-}
-
-func (r *readyState) NextReason() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	reason := r.reason
-	if reason != "reconnect" {
-		r.reason = "reconnect"
-	}
-	return reason
-}
-
-func sendNodeReady(ctx context.Context, client *gateway.Client, reason string) error {
-	if client == nil {
-		return errors.New("gateway client not ready")
-	}
-	payload := gateway.EventParams{
-		Event: "node.ready",
-		Data: map[string]interface{}{
-			"reason":    reason,
-			"timestamp": time.Now().UnixMilli(),
-		},
-	}
-	return client.SendEvent(ctx, "node.event", payload)
 }

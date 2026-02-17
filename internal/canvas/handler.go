@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/openclaw/openclaw-node-kobo/internal/eink"
@@ -23,6 +24,7 @@ type Handler struct {
 	sender            ActionSender
 	resetIdle         func()
 	commandProcessing func(bool)
+	renderMu          sync.RWMutex
 }
 
 func NewHandler(fb *eink.Framebuffer, renderer *Renderer, sender ActionSender, logger zerolog.Logger) *Handler {
@@ -48,16 +50,21 @@ func (h *Handler) HandleInvoke(ctx context.Context, req InvokeRequest) (interfac
 	case "canvas.present":
 		return h.present(false)
 	case "canvas.hide":
+		h.renderMu.Lock()
 		h.renderer.Clear()
 		if err := h.fb.WriteGray(h.renderer.Image); err != nil {
+			h.renderMu.Unlock()
 			return nil, err
 		}
+		h.renderMu.Unlock()
 		return nil, h.fb.Refresh(eink.Update{Full: true})
 	case "canvas.navigate":
 		return nil, errors.New("canvas.navigate not supported on Kobo")
 	case "canvas.eval":
 		return nil, errors.New("canvas.eval not supported on Kobo")
 	case "canvas.snapshot":
+		h.renderMu.RLock()
+		defer h.renderMu.RUnlock()
 		return SnapshotBase64(h.renderer.Image)
 	case "canvas.a2ui.push":
 		return h.handleA2UIPush(req.Args)
@@ -65,10 +72,13 @@ func (h *Handler) HandleInvoke(ctx context.Context, req InvokeRequest) (interfac
 		return h.handleA2UIPushJSONL(req.Args)
 	case "canvas.a2ui.reset":
 		h.state.Reset()
+		h.renderMu.Lock()
 		h.renderer.Clear()
 		if err := h.fb.WriteGray(h.renderer.Image); err != nil {
+			h.renderMu.Unlock()
 			return nil, err
 		}
+		h.renderMu.Unlock()
 		return nil, h.fb.Refresh(eink.Update{Full: true})
 	default:
 		return nil, errors.New("unknown canvas command")
@@ -105,6 +115,8 @@ func (h *Handler) handleA2UIPushJSONL(args json.RawMessage) (interface{}, error)
 }
 
 func (h *Handler) present(partial bool) (interface{}, error) {
+	h.renderMu.Lock()
+	defer h.renderMu.Unlock()
 	h.renderer.Render(h.state.Components())
 	if err := h.fb.WriteGray(h.renderer.Image); err != nil {
 		return nil, err
@@ -117,7 +129,9 @@ func (h *Handler) present(partial bool) (interface{}, error) {
 }
 
 func (h *Handler) HandleTouch(ctx context.Context, x, y int) {
+	h.renderMu.RLock()
 	action := h.renderer.HitTest(x, y)
+	h.renderMu.RUnlock()
 	if action == nil || h.sender == nil {
 		return
 	}
@@ -164,6 +178,8 @@ func (h *Handler) HandleInvokeRequest(ctx context.Context, req InvokeRequest) (i
 }
 
 func (h *Handler) FullRefresh() error {
+	h.renderMu.Lock()
+	defer h.renderMu.Unlock()
 	h.renderer.Render(h.state.Components())
 	if err := h.fb.WriteGray(h.renderer.Image); err != nil {
 		return err

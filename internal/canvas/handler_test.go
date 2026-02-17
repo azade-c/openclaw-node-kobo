@@ -3,6 +3,7 @@ package canvas
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"github.com/openclaw/openclaw-node-kobo/internal/eink"
@@ -56,4 +57,46 @@ func TestHandlerA2UIPush(t *testing.T) {
 		// no action registered, should not send
 		t.Fatalf("unexpected action send")
 	}
+}
+
+func TestHandlerConcurrentRenderHitTest(t *testing.T) {
+	fb := eink.NewFramebufferFromBuffer(100, 50)
+	renderer := NewRenderer(100, 50)
+	h := NewHandler(fb, renderer, nil, zerolog.Nop())
+
+	payload := map[string]interface{}{
+		"components": []map[string]interface{}{
+			{
+				"type":   "box",
+				"x":      0,
+				"y":      0,
+				"width":  10,
+				"height": 10,
+			},
+		},
+	}
+	args, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := h.HandleInvokeRequest(context.Background(), InvokeRequest{Command: "canvas.a2ui.push", Args: args}); err != nil {
+		t.Fatalf("handle invoke: %v", err)
+	}
+
+	const iterations = 100
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_, _ = h.HandleInvokeRequest(context.Background(), InvokeRequest{Command: "canvas.present"})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			h.HandleTouch(context.Background(), 1, 1)
+		}
+	}()
+	wg.Wait()
 }

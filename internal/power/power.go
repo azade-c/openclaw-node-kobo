@@ -52,13 +52,13 @@ func (t *systemTimer) Reset(d time.Duration) bool {
 type Manager struct {
 	IdleTimeout    time.Duration
 	SuspendEnabled bool
-	WiFiScript     string
 	OnSuspend      func()
 	OnResume       func()
 
 	clock        clock
 	suspendFunc  func() error
 	debounce     time.Duration
+	initOnce     sync.Once
 	idleMu       sync.Mutex
 	idleTimer    timer
 	suspending   atomic.Bool
@@ -156,15 +156,17 @@ func (m *Manager) canSuspend() bool {
 }
 
 func (m *Manager) init() {
-	if m.clock == nil {
-		m.clock = systemClock{}
-	}
-	if m.suspendFunc == nil {
-		m.suspendFunc = suspendToRAM
-	}
-	if m.debounce == 0 {
-		m.debounce = 30 * time.Second
-	}
+	m.initOnce.Do(func() {
+		if m.clock == nil {
+			m.clock = systemClock{}
+		}
+		if m.suspendFunc == nil {
+			m.suspendFunc = suspendToRAM
+		}
+		if m.debounce == 0 {
+			m.debounce = 30 * time.Second
+		}
+	})
 }
 
 func drainTimer(t timer) {

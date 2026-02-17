@@ -7,6 +7,12 @@ func TestDefaultRegistration(t *testing.T) {
 	if reg.Role != "node" {
 		t.Fatalf("expected role node")
 	}
+	if reg.Client.ID == "" {
+		t.Fatalf("expected client id")
+	}
+	if reg.Client.Mode != "node" {
+		t.Fatalf("expected client mode node")
+	}
 	if len(reg.Caps) == 0 || reg.Caps[0] != "canvas" {
 		t.Fatalf("expected canvas cap")
 	}

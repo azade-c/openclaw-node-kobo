@@ -2,6 +2,13 @@ package gateway
 
 func DefaultRegistration() NodeRegistration {
 	return NodeRegistration{
+		Client: ClientInfo{
+			ID:          "openclaw-node-kobo",
+			DisplayName: "Kobo",
+			Version:     "0.1",
+			Platform:    "linux",
+			Mode:        "node",
+		},
 		Role: "node",
 		Caps: []string{"canvas"},
 		Commands: []string{

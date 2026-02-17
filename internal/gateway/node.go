@@ -3,11 +3,12 @@ package gateway
 func DefaultRegistration() NodeRegistration {
 	return NodeRegistration{
 		Client: ClientInfo{
-			ID:          "node-host",
-			DisplayName: "Kobo",
-			Version:     "0.1",
-			Platform:    "linux",
-			Mode:        "node",
+			ID:           "node-host",
+			DisplayName:  "Kobo",
+			Version:      "0.1",
+			Platform:     "linux",
+			DeviceFamily: "kobo",
+			Mode:         "node",
 		},
 		Role: "node",
 		Caps: []string{"canvas"},

@@ -31,29 +31,37 @@ type wsConn interface {
 }
 
 type Client struct {
-	url          string
-	header       http.Header
-	dialer       DialContextFunc
-	logger       zerolog.Logger
-	register     NodeRegistration
-	onInvoke     InvokeHandler
-	onRegistered func(context.Context) error
-	connMu       sync.Mutex
-	conn         wsConn
-	writeMu      sync.Mutex
-	requestSeq   atomic.Uint64
-	pingInterval time.Duration
+	url             string
+	header          http.Header
+	dialer          DialContextFunc
+	logger          zerolog.Logger
+	register        NodeRegistration
+	onInvoke        InvokeHandler
+	onRegistered    func(context.Context) error
+	connectAuth     *ConnectAuth
+	identity        *DeviceIdentity
+	deviceToken     string
+	deviceTokenPath string
+	connMu          sync.Mutex
+	conn            wsConn
+	writeMu         sync.Mutex
+	requestSeq      atomic.Uint64
+	pingInterval    time.Duration
 }
 
 type Config struct {
-	URL          string
-	Header       http.Header
-	Dialer       DialContextFunc
-	Logger       zerolog.Logger
-	Register     NodeRegistration
-	OnInvoke     InvokeHandler
-	OnRegistered func(context.Context) error
-	PingInterval time.Duration
+	URL             string
+	Header          http.Header
+	Dialer          DialContextFunc
+	Logger          zerolog.Logger
+	Register        NodeRegistration
+	OnInvoke        InvokeHandler
+	OnRegistered    func(context.Context) error
+	PingInterval    time.Duration
+	AuthToken       string
+	AuthPassword    string
+	Identity        *DeviceIdentity
+	DeviceTokenPath string
 }
 
 func New(cfg Config) *Client {
@@ -61,15 +69,35 @@ func New(cfg Config) *Client {
 	if pingInterval == 0 {
 		pingInterval = 30 * time.Second
 	}
+	var connectAuth *ConnectAuth
+	if cfg.AuthToken != "" || cfg.AuthPassword != "" {
+		connectAuth = &ConnectAuth{
+			Token:    cfg.AuthToken,
+			Password: cfg.AuthPassword,
+		}
+	}
+	deviceToken := ""
+	if cfg.DeviceTokenPath != "" {
+		token, err := LoadDeviceToken(cfg.DeviceTokenPath)
+		if err != nil {
+			cfg.Logger.Warn().Err(err).Msg("gateway: failed to load device token")
+		} else {
+			deviceToken = token
+		}
+	}
 	return &Client{
-		url:          cfg.URL,
-		header:       cfg.Header,
-		dialer:       cfg.Dialer,
-		logger:       cfg.Logger,
-		register:     cfg.Register,
-		onInvoke:     cfg.OnInvoke,
-		onRegistered: cfg.OnRegistered,
-		pingInterval: pingInterval,
+		url:             cfg.URL,
+		header:          cfg.Header,
+		dialer:          cfg.Dialer,
+		logger:          cfg.Logger,
+		register:        cfg.Register,
+		onInvoke:        cfg.OnInvoke,
+		onRegistered:    cfg.OnRegistered,
+		connectAuth:     connectAuth,
+		identity:        cfg.Identity,
+		deviceToken:     deviceToken,
+		deviceTokenPath: cfg.DeviceTokenPath,
+		pingInterval:    pingInterval,
 	}
 }
 
@@ -88,25 +116,21 @@ func (c *Client) Run(ctx context.Context) error {
 		conn, err := c.connect(ctx)
 		if err != nil {
 			c.logger.Warn().Err(err).Msg("gateway connect failed")
-			timer := time.NewTimer(backoff)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-			if backoff < 30*time.Second {
-				backoff *= 2
+			if err := c.waitBackoff(ctx, &backoff); err != nil {
+				return err
 			}
 			continue
 		}
-		backoff = time.Second
 		c.setConn(conn)
 		if err := c.registerNode(ctx); err != nil {
 			c.logger.Error().Err(err).Msg("gateway registration failed")
 			c.closeConn()
+			if err := c.waitBackoff(ctx, &backoff); err != nil {
+				return err
+			}
 			continue
 		}
+		backoff = time.Second
 		if c.onRegistered != nil {
 			if err := c.onRegistered(ctx); err != nil {
 				c.logger.Warn().Err(err).Msg("gateway registered callback failed")
@@ -115,6 +139,9 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := c.readLoop(ctx); err != nil {
 			c.logger.Warn().Err(err).Msg("gateway read loop ended")
 			c.closeConn()
+			if err := c.waitBackoff(ctx, &backoff); err != nil {
+				return err
+			}
 			continue
 		}
 	}
@@ -178,6 +205,34 @@ func (c *Client) registerNode(ctx context.Context) error {
 		return errors.New("gateway: no connection")
 	}
 	id := c.nextID()
+	auth := c.connectAuth
+	tokenForPayload := ""
+	if c.deviceToken != "" {
+		auth = &ConnectAuth{Token: c.deviceToken}
+		tokenForPayload = c.deviceToken
+	} else if c.connectAuth != nil {
+		tokenForPayload = c.connectAuth.Token
+	}
+	var deviceInfo *DeviceInfo
+	if c.identity != nil {
+		signedAtMs := time.Now().UnixMilli()
+		payload := BuildDeviceAuthPayload(
+			c.identity.DeviceID,
+			c.register.Client.ID,
+			c.register.Client.Mode,
+			c.register.Role,
+			nil,
+			signedAtMs,
+			tokenForPayload,
+			"",
+		)
+		deviceInfo = &DeviceInfo{
+			ID:        c.identity.DeviceID,
+			PublicKey: c.identity.PublicKeyRawBase64Url(),
+			Signature: c.identity.Sign(payload),
+			SignedAt:  signedAtMs,
+		}
+	}
 	params, err := json.Marshal(ConnectParams{
 		MinProtocol: ProtocolVersion,
 		MaxProtocol: ProtocolVersion,
@@ -185,6 +240,8 @@ func (c *Client) registerNode(ctx context.Context) error {
 		Role:        c.register.Role,
 		Caps:        c.register.Caps,
 		Commands:    c.register.Commands,
+		Auth:        auth,
+		Device:      deviceInfo,
 	})
 	if err != nil {
 		return err
@@ -231,14 +288,20 @@ func (c *Client) registerNode(ctx context.Context) error {
 			}
 			return errors.New("gateway: connect rejected")
 		}
-		var hello struct {
-			Type string `json:"type"`
-		}
+		var hello HelloOkPayload
 		if err := json.Unmarshal(res.Payload, &hello); err != nil {
 			return err
 		}
 		if hello.Type != "hello-ok" {
 			return errors.New("gateway: unexpected handshake payload")
+		}
+		if hello.Auth != nil && hello.Auth.DeviceToken != "" {
+			c.deviceToken = hello.Auth.DeviceToken
+			if c.deviceTokenPath != "" {
+				if err := SaveDeviceToken(c.deviceTokenPath, c.deviceToken); err != nil {
+					c.logger.Warn().Err(err).Msg("gateway: failed to save device token")
+				}
+			}
 		}
 		return nil
 	}
@@ -412,4 +475,18 @@ func (c *Client) closeConn() {
 		_ = c.conn.Close()
 		c.conn = nil
 	}
+}
+
+func (c *Client) waitBackoff(ctx context.Context, backoff *time.Duration) error {
+	timer := time.NewTimer(*backoff)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+	}
+	if *backoff < 30*time.Second {
+		*backoff *= 2
+	}
+	return nil
 }

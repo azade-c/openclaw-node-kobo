@@ -42,13 +42,28 @@ type ClientInfo struct {
 	InstanceID  string `json:"instanceId,omitempty"`
 }
 
+type ConnectAuth struct {
+	Token    string `json:"token,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
 type ConnectParams struct {
-	MinProtocol int        `json:"minProtocol"`
-	MaxProtocol int        `json:"maxProtocol"`
-	Client      ClientInfo `json:"client"`
-	Role        string     `json:"role,omitempty"`
-	Caps        []string   `json:"caps,omitempty"`
-	Commands    []string   `json:"commands,omitempty"`
+	MinProtocol int          `json:"minProtocol"`
+	MaxProtocol int          `json:"maxProtocol"`
+	Client      ClientInfo   `json:"client"`
+	Role        string       `json:"role,omitempty"`
+	Caps        []string     `json:"caps,omitempty"`
+	Commands    []string     `json:"commands,omitempty"`
+	Auth        *ConnectAuth `json:"auth,omitempty"`
+	Device      *DeviceInfo  `json:"device,omitempty"`
+}
+
+type DeviceInfo struct {
+	ID        string `json:"id"`
+	PublicKey string `json:"publicKey"`
+	Signature string `json:"signature"`
+	SignedAt  int64  `json:"signedAt"`
+	Nonce     string `json:"nonce,omitempty"`
 }
 
 type NodeRegistration struct {
@@ -56,6 +71,18 @@ type NodeRegistration struct {
 	Role     string     `json:"role"`
 	Caps     []string   `json:"caps"`
 	Commands []string   `json:"commands"`
+}
+
+type HelloOkPayload struct {
+	Type string       `json:"type"`
+	Auth *HelloOkAuth `json:"auth,omitempty"`
+}
+
+type HelloOkAuth struct {
+	DeviceToken string   `json:"deviceToken,omitempty"`
+	Role        string   `json:"role,omitempty"`
+	Scopes      []string `json:"scopes,omitempty"`
+	IssuedAtMs  int64    `json:"issuedAtMs,omitempty"`
 }
 
 type InvokeRequestParams struct {

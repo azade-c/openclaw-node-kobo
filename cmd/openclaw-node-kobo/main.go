@@ -45,6 +45,8 @@ func main() {
 	gatewayPort := flag.Int("gateway-port", 0, "gateway port")
 	gatewayTLS := flag.Bool("gateway-tls", false, "use TLS for gateway")
 	gatewayPath := flag.String("gateway-path", "", "gateway websocket path")
+	gatewayToken := flag.String("gateway-token", "", "gateway auth token")
+	gatewayPassword := flag.String("gateway-password", "", "gateway auth password")
 	name := flag.String("name", "", "node name")
 	stateDir := flag.String("state-dir", "", "tsnet state directory")
 	touchDevice := flag.String("touch-device", "", "touch input device path")
@@ -88,6 +90,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	identityPath := filepath.Join(filepath.Dir(*cfgPath), "device.json")
+	identity, err := gateway.LoadOrCreateIdentity(identityPath)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to load device identity")
+	}
+	deviceTokenPath := filepath.Join(filepath.Dir(*cfgPath), "device-token.json")
+
 	tail := tailnet.New(tailnet.Config{
 		Hostname: cfg.Name,
 		StateDir: cfg.StateDir,
@@ -114,11 +123,15 @@ func main() {
 	registration := gateway.DefaultRegistration()
 	registration.Client.DisplayName = cfg.Name
 	client = gateway.New(gateway.Config{
-		URL:      wsURL,
-		Header:   http.Header{"User-Agent": {userAgent(cfg)}},
-		Dialer:   tail.DialContext,
-		Logger:   log.Logger,
-		Register: registration,
+		URL:             wsURL,
+		Header:          http.Header{"User-Agent": {userAgent(cfg)}},
+		Dialer:          tail.DialContext,
+		Logger:          log.Logger,
+		Register:        registration,
+		AuthToken:       *gatewayToken,
+		AuthPassword:    *gatewayPassword,
+		Identity:        identity,
+		DeviceTokenPath: deviceTokenPath,
 		OnInvoke: func(ctx context.Context, req gateway.InvokeRequestParams) (interface{}, error) {
 			if handler == nil {
 				return nil, errors.New("handler not ready")

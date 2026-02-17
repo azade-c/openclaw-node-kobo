@@ -31,6 +31,11 @@ func (s *Server) DialContext(ctx context.Context, network, address string) (net.
 	return s.srv.Dial(ctx, network, address)
 }
 
+func (s *Server) Up(ctx context.Context) error {
+	_, err := s.srv.Up(ctx)
+	return err
+}
+
 func (s *Server) Close() error {
 	return s.srv.Close()
 }

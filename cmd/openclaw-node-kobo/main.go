@@ -146,6 +146,11 @@ func main() {
 		if err := waitForIP(waitCtx, wifiInterface()); err != nil {
 			log.Warn().Err(err).Msg("wifi did not acquire IP")
 		}
+		tailCtx, cancelTail := context.WithTimeout(ctx, 30*time.Second)
+		defer cancelTail()
+		if err := tail.Up(tailCtx); err != nil {
+			log.Warn().Err(err).Msg("tailscale did not become ready")
+		}
 		if err := handler.FullRefresh(); err != nil {
 			log.Warn().Err(err).Msg("failed full refresh after wake")
 		}

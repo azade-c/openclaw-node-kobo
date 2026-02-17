@@ -185,6 +185,38 @@ func TestManagerSuspendDebounce(t *testing.T) {
 	}
 }
 
+func TestManagerSuspendCallbacks(t *testing.T) {
+	clock := newFakeClock(time.Unix(1, 0))
+	var order []string
+	m := &Manager{
+		IdleTimeout:    time.Second,
+		SuspendEnabled: true,
+		clock:          clock,
+		suspendFunc: func() error {
+			order = append(order, "suspend")
+			return nil
+		},
+	}
+	m.OnSuspend = func() {
+		order = append(order, "onSuspend")
+	}
+	m.OnResume = func() {
+		order = append(order, "onResume")
+	}
+	if err := m.Suspend(); err != nil {
+		t.Fatalf("expected suspend to succeed, got %v", err)
+	}
+	want := []string{"onSuspend", "suspend", "onResume"}
+	if len(order) != len(want) {
+		t.Fatalf("expected %v callbacks, got %v", want, order)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("expected callback order %v, got %v", want, order)
+		}
+	}
+}
+
 func TestManagerSuspendInProgress(t *testing.T) {
 	clock := newFakeClock(time.Unix(1, 0))
 	blockCh := make(chan struct{})

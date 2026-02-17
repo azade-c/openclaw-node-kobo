@@ -3,7 +3,7 @@ package gateway
 func DefaultRegistration() NodeRegistration {
 	return NodeRegistration{
 		Client: ClientInfo{
-			ID:          "openclaw-node-kobo",
+			ID:          "node-host",
 			DisplayName: "Kobo",
 			Version:     "0.1",
 			Platform:    "linux",

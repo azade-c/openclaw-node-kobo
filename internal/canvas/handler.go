@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/openclaw/openclaw-node-kobo/internal/eink"
+	"github.com/openclaw/openclaw-node-kobo/internal/gateway"
 	"github.com/rs/zerolog"
 )
 
@@ -135,14 +136,18 @@ func (h *Handler) HandleTouch(ctx context.Context, x, y int) {
 	if action == nil || h.sender == nil {
 		return
 	}
-	payload := map[string]interface{}{
+	actionPayload := map[string]interface{}{
 		"type":    action.Type,
 		"payload": json.RawMessage(action.Payload),
 		"x":       x,
 		"y":       y,
 		"time":    time.Now().UnixMilli(),
 	}
-	if err := h.sender.SendEvent(ctx, "canvas.a2ui.action", payload); err != nil {
+	params := gateway.NodeEventParams{
+		Event:   "canvas.a2ui.action",
+		Payload: actionPayload,
+	}
+	if err := h.sender.SendEvent(ctx, "node.event", params); err != nil {
 		h.logger.Warn().Err(err).Msg("failed to send A2UI action")
 	}
 }
